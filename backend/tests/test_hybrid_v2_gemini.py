@@ -13,7 +13,31 @@ Design constraints:
 """
 from __future__ import annotations
 import json
+import pytest
 from unittest.mock import patch
+
+
+@pytest.fixture(autouse=True)
+def enable_llm_for_hybrid_tests():
+    """Exercise the AI branch by default without changing production defaults.
+
+    Individual tests can still override this fixture's patched setting (T01 verifies
+    the disabled path and T14 supplies a sentinel API key for redaction checks).
+    """
+    import app.core.config as cfg_mod
+
+    real = cfg_mod.get_settings()
+
+    class FakeOn:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @property
+        def llm_enabled(self):
+            return True
+
+    with patch("app.services.medallion.get_settings", return_value=FakeOn()):
+        yield
 
 
 def _col(name, dtype, nullable=True, precision=None, scale=None):
