@@ -1,0 +1,642 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.models.entities import (
+    MigrationArtifact,
+    MigrationArtifactVersion,
+    MigrationClassification,
+    MigrationColumn,
+    MigrationDependency,
+    MigrationIssue,
+    MigrationMapping,
+    MigrationObject,
+    MigrationProject,
+    MigrationQualityGate,
+    MigrationReview,
+    MigrationRun,
+    MigrationSource,
+)
+from app.models.canonical import (
+    MigrationDeployment,
+    MigrationRunStep,
+    MigrationValidation,
+    MigrationReconciliation,
+    MigrationReconciliationDetail,
+)
+from app.services.databricks_client import execute_sql, databricks_connection
+from app.services.engine import compare_schema, topo_order, uid
+from app.services.discovery import test_sqlserver_connection
+from app.services.type_compatibility import (
+    classify_execution_error,
+    normalize_row,
+    source_select_expression,
+    target_parameter_expression,
+    transport_contract,
+    transport_summary,
+)
+
+
+DEPLOYABLE_TYPES = {"TABLE", "VIEW", "FUNCTION", "PROCEDURE"}
+NON_EXECUTABLE_MARKERS = (
+    "-- REVIEW_REQUIRED",
+    "-- ARCHITECT_REVIEW_REQUIRED",
+    "-- RECOMMENDED_TARGET: MANUAL",
+    "-- NON_EXECUTABLE:",
+)
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+def _payload(row) -> dict[str, Any]:
+    try:
+        return json.loads(row.payload_json or "{}")
+    except Exception:
+        return {}
+
+
+def _record_step(db: Session, project_id: str, run_id: str, name: str, status: str,
+                 object_id: str | None = None, environment: str = "DEV", **details) -> MigrationRunStep:
+    row = MigrationRunStep(
+        id=uid("STP"), project_id=project_id, object_id=object_id,
+        environment=environment, status=status,
+        payload_json=_json({"run_id": run_id, "step": name, **details}),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def _deployment_evidence(db: Session, project_id: str, run_id: str, status: str,
+                         environment: str = "DEV", object_id: str | None = None, **details):
+    row = MigrationDeployment(
+        id=uid("DPL"), project_id=project_id, object_id=object_id,
+        environment=environment, status=status,
+        payload_json=_json({"run_id": run_id, **details}),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def _validation_evidence(db: Session, project_id: str, run_id: str, status: str,
+                         environment: str = "DEV", object_id: str | None = None, **details):
+    row = MigrationValidation(
+        id=uid("VAL"), project_id=project_id, object_id=object_id,
+        environment=environment, status=status,
+        payload_json=_json({"run_id": run_id, **details}),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def _latest_current_versions(db: Session, project_id: str) -> list[tuple[MigrationArtifact, MigrationArtifactVersion, MigrationObject]]:
+    # Defensive de-duplication by source object. Older builds could leave more than one
+    # artifact row for an object; deployment must evaluate exactly one current version.
+    chosen: dict[str, tuple[MigrationArtifact, MigrationArtifactVersion, MigrationObject]] = {}
+    arts = db.scalars(select(MigrationArtifact).where(MigrationArtifact.project_id == project_id)).all()
+    for art in arts:
+        av = db.scalar(select(MigrationArtifactVersion).where(
+            MigrationArtifactVersion.project_id == project_id,
+            MigrationArtifactVersion.artifact_id == art.id,
+            MigrationArtifactVersion.version == art.current_version,
+        ))
+        obj = db.get(MigrationObject, art.object_id)
+        if not (av and obj and obj.project_id == project_id):
+            continue
+        prior=chosen.get(obj.id)
+        if prior is None or (av.created_at, av.version, av.id) > (prior[1].created_at, prior[1].version, prior[1].id):
+            chosen[obj.id]=(art,av,obj)
+    return sorted(chosen.values(), key=lambda x:(x[2].schema_name.lower(),x[2].object_name.lower(),x[2].object_type))
+
+
+def _approved(db: Session, project_id: str, version_id: str) -> bool:
+    # Review decisions are immutable audit events. The latest decision is the effective state.
+    latest = db.scalars(select(MigrationReview).where(
+        MigrationReview.project_id == project_id,
+        MigrationReview.artifact_version_id == version_id,
+    ).order_by(MigrationReview.reviewed_at.desc())).first()
+    return bool(latest and latest.status == "APPROVED")
+
+
+def _mapping(db: Session, project_id: str, object_id: str, environment: str) -> MigrationMapping | None:
+    return db.scalar(select(MigrationMapping).where(
+        MigrationMapping.project_id == project_id,
+        MigrationMapping.object_id == object_id,
+        MigrationMapping.environment == environment.upper(),
+    ))
+
+
+def _parse_target_fqn(fqn: str) -> tuple[str, str, str]:
+    parts = [x.strip().strip('`') for x in fqn.split('.')]
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(f"Target FQN must be catalog.schema.object: {fqn}")
+    return parts[0], parts[1], parts[2]
+
+
+def _expected_schema(db: Session, project_id: str, object_id: str) -> list[dict[str, str]]:
+    from app.services.rules import map_sqlserver_type
+    cols = db.scalars(select(MigrationColumn).where(
+        MigrationColumn.project_id == project_id,
+        MigrationColumn.object_id == object_id,
+    ).order_by(MigrationColumn.ordinal)).all()
+    result = [{"name": c.column_name, "type": map_sqlserver_type(c.data_type, c.precision, c.scale)} for c in cols]
+    result += [
+        {"name": "_migration_ingested_at", "type": "TIMESTAMP"},
+        {"name": "_migration_source_system", "type": "STRING"},
+    ]
+    return result
+
+
+def _describe_target(fqn: str) -> list[dict[str, str]] | None:
+    try:
+        rows = execute_sql(f"DESCRIBE TABLE {fqn}", safe_retry=True)
+    except Exception as e:
+        text = str(e).lower()
+        if any(x in text for x in ("table_or_view_not_found", "not found", "does not exist", "cannot be found")):
+            return None
+        raise
+    actual = []
+    for row in rows:
+        if not row or not row[0] or str(row[0]).startswith("#"):
+            continue
+        actual.append({"name": str(row[0]), "type": str(row[1])})
+    return actual
+
+
+def _dependency_order(db: Session, project_id: str, object_ids: set[str]) -> list[str]:
+    objects = db.scalars(select(MigrationObject).where(MigrationObject.project_id == project_id)).all()
+    lookup: dict[tuple[str, str], str] = {(o.schema_name.lower(), o.object_name.lower()): o.id for o in objects}
+    edges: list[tuple[str, str]] = []
+    for dep in db.scalars(select(MigrationDependency).where(MigrationDependency.project_id == project_id)).all():
+        if dep.object_id not in object_ids or not dep.referenced_object:
+            continue
+        target_id = None
+        if dep.referenced_schema:
+            target_id = lookup.get((dep.referenced_schema.lower(), dep.referenced_object.lower()))
+        else:
+            # Some dependency metadata can omit schema. Resolve only when the object name is
+            # unambiguous within the current project; never silently assume dbo or another schema.
+            matches = [oid for (schema_name, object_name), oid in lookup.items() if object_name == dep.referenced_object.lower()]
+            if len(matches) == 1:
+                target_id = matches[0]
+        if target_id and target_id in object_ids and target_id != dep.object_id:
+            edges.append((dep.object_id, target_id))
+    if not edges:
+        # Tables before dependent layers gives deterministic stable order when dependency metadata is sparse.
+        layer_rank = {"BRONZE": 0, "SILVER": 1, "GOLD": 2}
+        objs = [o for o in objects if o.id in object_ids]
+        def rank(o):
+            c = db.scalar(select(MigrationClassification).where(
+                MigrationClassification.project_id == project_id,
+                MigrationClassification.object_id == o.id,
+            ))
+            return (layer_rank.get(c.selected_layer if c else "BRONZE", 9), o.schema_name.lower(), o.object_name.lower())
+        return [o.id for o in sorted(objs, key=rank)]
+    ordered = topo_order(edges)
+    remaining = sorted(object_ids - set(ordered))
+    return [x for x in ordered if x in object_ids] + remaining
+
+
+def dev_precheck(db: Session, project_id: str, test_databricks: bool = True, ignore_deployment_issues: bool = False) -> dict[str, Any]:
+    if not db.get(MigrationProject, project_id):
+        raise ValueError("Project not found")
+    blockers: list[dict[str, str]] = []
+    warnings: list[str] = []
+    versions = _latest_current_versions(db, project_id)
+    if not versions:
+        blockers.append({"code": "NO_ARTIFACTS", "message": "No generated artifacts exist for this project."})
+
+    for art, av, obj in versions:
+        if not _approved(db, project_id, av.id):
+            blockers.append({"code": "APPROVAL", "message": f"{obj.schema_name}.{obj.object_name} v{av.version} is not approved."})
+        if av.source_hash != (obj.source_hash or ""):
+            blockers.append({"code": "SOURCE_DRIFT", "message": f"{obj.schema_name}.{obj.object_name} source metadata changed after artifact generation."})
+        if not _mapping(db, project_id, obj.id, "DEV"):
+            blockers.append({"code": "MAPPING", "message": f"DEV mapping missing for {obj.schema_name}.{obj.object_name}."})
+        if obj.object_type == "TRIGGER":
+            blockers.append({"code": "ARCHITECTURE_REVIEW", "message": f"Trigger {obj.schema_name}.{obj.object_name} cannot be blindly deployed."})
+        if any(marker in av.content for marker in NON_EXECUTABLE_MARKERS):
+            blockers.append({"code": "NON_EXECUTABLE_ARTIFACT", "message": f"{obj.schema_name}.{obj.object_name} is approved for review but is not an executable Databricks artifact yet."})
+        if obj.object_type == "TABLE":
+            cols = db.scalars(select(MigrationColumn).where(
+                MigrationColumn.project_id == project_id,
+                MigrationColumn.object_id == obj.id,
+                MigrationColumn.is_computed == False,  # noqa: E712
+            ).order_by(MigrationColumn.ordinal)).all()
+            for item in transport_contract(cols):
+                if item["review_required"]:
+                    warnings.append(
+                        f"{obj.schema_name}.{obj.object_name}.{item['column']}: {item['source_type']} uses "
+                        f"{item['strategy']} ({item['notes']})"
+                    )
+
+    open_blockers = db.scalars(select(MigrationIssue).where(
+        MigrationIssue.project_id == project_id,
+        MigrationIssue.status == "OPEN",
+        MigrationIssue.severity == "BLOCKER",
+    )).all()
+    if ignore_deployment_issues:
+        open_blockers = [x for x in open_blockers if x.issue_type != "DEPLOYMENT"]
+    if open_blockers:
+        blockers.append({"code": "OPEN_ISSUES", "message": f"{len(open_blockers)} open blocker issue(s) must be resolved."})
+
+    dbx = {"tested": False, "ok": None}
+    if test_databricks:
+        try:
+            rows = execute_sql("SELECT current_catalog(), current_schema(), current_user()", safe_retry=True)
+            dbx = {"tested": True, "ok": True, "result": [list(r) for r in rows]}
+        except Exception as e:
+            blockers.append({"code": "DATABRICKS_CONNECTIVITY", "message": str(e)})
+            dbx = {"tested": True, "ok": False, "error": str(e)}
+
+    # Stable, unique blocker list prevents repeated messages for the same object/rule.
+    unique_blockers=[]
+    seen=set()
+    for item in blockers:
+        key=(item.get("code"),item.get("message"))
+        if key not in seen:
+            seen.add(key); unique_blockers.append(item)
+    blockers=unique_blockers
+    result = {
+        "eligible": not blockers,
+        "environment": "DEV",
+        "approved_artifacts": len(versions) - sum(1 for _, av, _ in versions if not _approved(db, project_id, av.id)),
+        "artifact_count": len(versions),
+        "blockers": blockers,
+        "warnings": warnings,
+        "databricks": dbx,
+    }
+    _validation_evidence(db, project_id, "PRECHECK", "PASSED" if result["eligible"] else "BLOCKED", validation_type="DEV_PRECHECK", details=result)
+    return result
+
+
+def _safe_execute_artifact(content: str) -> None:
+    # One artifact version is treated as a single governed statement/batch. Destructive statements are rejected here.
+    upper = content.upper()
+    forbidden = ("DROP TABLE", "DROP VIEW", "DROP SCHEMA", "TRUNCATE TABLE", "DELETE FROM")
+    if any(x in upper for x in forbidden):
+        raise RuntimeError("Generated artifact contains a destructive statement; explicit governed replacement is required.")
+    execute_sql(content, safe_retry=False)
+
+
+def _apply_table_schema_policy(db: Session, project_id: str, obj: MigrationObject, mapping: MigrationMapping,
+                               allow_destructive: bool) -> dict[str, Any]:
+    cfg = get_settings()
+    actual = _describe_target(mapping.target_fqn)
+    if actual is None:
+        return {"action": "CREATE", "schema_status": "MISSING"}
+    expected = _expected_schema(db, project_id, obj.id)
+    drift = compare_schema(expected, actual)
+    if drift["status"] == "IDENTICAL":
+        return {"action": "REUSE", "schema_status": "IDENTICAL", "drift": drift}
+    if drift["status"] == "NON_BREAKING_CHANGE" and cfg.deployment_policy in {"ALTER_SAFE_CHANGES", "REPLACE_IN_DEV"}:
+        existing = {x["name"].lower() for x in actual}
+        for col in expected:
+            if col["name"].lower() not in existing:
+                execute_sql(f"ALTER TABLE {mapping.target_fqn} ADD COLUMN `{col['name']}` {col['type']}", safe_retry=False)
+        return {"action": "ALTER_SAFE", "schema_status": drift["status"], "drift": drift}
+    if cfg.dev_schema_policy.upper() == "REPLACE_CHANGED" and allow_destructive:
+        return {"action": "REPLACE", "schema_status": drift["status"], "drift": drift}
+    raise RuntimeError(f"Target schema drift is {drift['status']}; destructive replacement is blocked without explicit approval.")
+
+
+def _source_connection_string(src: MigrationSource) -> str:
+    cfg = get_settings()
+    driver = cfg.sqlserver_driver.replace("{", "").replace("}", "")
+    if cfg.sqlserver_username:
+        return (f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};"
+                f"UID={cfg.sqlserver_username};PWD={cfg.sqlserver_password or ''};TrustServerCertificate=yes;")
+    return (f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};"
+            "Trusted_Connection=yes;TrustServerCertificate=yes;")
+
+
+def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mapping: MigrationMapping,
+                      run_id: str, batch_size: int, max_rows: int | None, load_mode: str,
+                      replace_existing_data: bool) -> dict[str, Any]:
+    if obj.object_type != "TABLE" or mapping.target_layer != "BRONZE":
+        return {"status": "SKIPPED", "rows": 0, "reason": "Not a Bronze table"}
+    if load_mode.upper() not in {"FULL_LOAD", "APPEND"}:
+        raise RuntimeError(f"Load mode {load_mode} requires watermark/CDC metadata not configured for this object.")
+    if load_mode.upper() == "FULL_LOAD":
+        existing = execute_sql(f"SELECT COUNT(*) FROM {mapping.target_fqn}", safe_retry=True)
+        existing_count = int(existing[0][0]) if existing else 0
+        if existing_count and not replace_existing_data:
+            raise RuntimeError(f"Target {mapping.target_fqn} already contains {existing_count} rows. FULL_LOAD replacement requires explicit approval.")
+        if existing_count and replace_existing_data:
+            execute_sql(f"TRUNCATE TABLE {mapping.target_fqn}", safe_retry=False)
+
+    src = db.get(MigrationSource, obj.source_id)
+    if not src or src.project_id != project_id:
+        raise RuntimeError("Source profile not found for Bronze load")
+    cols = db.scalars(select(MigrationColumn).where(
+        MigrationColumn.project_id == project_id,
+        MigrationColumn.object_id == obj.id,
+        MigrationColumn.is_computed == False,  # noqa: E712
+    ).order_by(MigrationColumn.ordinal)).all()
+    names = [c.column_name for c in cols]
+    if not names:
+        return {"status": "PASSED", "rows": 0}
+
+    # Build the source projection and target bind expressions from discovered metadata.
+    # Binary/rowversion columns are transported as hexadecimal strings and reconstructed
+    # with unhex(?) on Databricks so the connector can never infer ARRAY<VOID>.
+    import pyodbc
+    select_cols = ",".join(source_select_expression(c) for c in cols)
+    source_table = f"[{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]"
+    sql_text = f"SELECT {select_cols} FROM {source_table}"
+    if max_rows:
+        sql_text = f"SELECT TOP ({int(max_rows)}) {select_cols} FROM {source_table}"
+    value_expressions = [target_parameter_expression(c) for c in cols] + ["?"]
+    placeholders = ",".join(value_expressions)
+    target_cols = ",".join([f"`{n.replace('`','``')}`" for n in names] + ["`_migration_source_system`"])
+    insert_sql = f"INSERT INTO {mapping.target_fqn} ({target_cols}, `_migration_ingested_at`) VALUES ({placeholders}, current_timestamp())"
+    contract = transport_contract(cols)
+    summary = transport_summary(cols)
+    rows_loaded = 0
+    with pyodbc.connect(_source_connection_string(src), timeout=30) as source_conn, databricks_connection() as target_conn:
+        scur = source_conn.cursor(); tcur = target_conn.cursor()
+        scur.execute(sql_text)
+        while True:
+            batch = scur.fetchmany(batch_size)
+            if not batch:
+                break
+            payload = []
+            batch_start = rows_loaded + 1
+            for offset, source_row in enumerate(batch):
+                # Normalize every value before any target write. This makes runtime type
+                # failures deterministic, column-aware and safe to resume because the
+                # bad batch is rejected before executemany is invoked.
+                normalized = normalize_row(cols, tuple(source_row), row_index=batch_start + offset)
+                payload.append(normalized + (f"{src.server_name}/{src.database_name}",))
+            tcur.executemany(insert_sql, payload)
+            rows_loaded += len(payload)
+    _record_step(
+        db, project_id, run_id, "BRONZE_LOAD", "PASSED", obj.id,
+        rows_loaded=rows_loaded, target=mapping.target_fqn, transport=summary,
+    )
+    return {"status": "PASSED", "rows": rows_loaded, "transport": summary, "contract": contract}
+
+
+def deploy_dev(db: Session, project_id: str, *, allow_destructive: bool = False,
+               batch_size: int | None = None, max_rows: int | None = None,
+               load_mode: str | None = None, replace_existing_data: bool = False,
+               resume_run_id: str | None = None) -> dict[str, Any]:
+    cfg = get_settings()
+    pre = dev_precheck(db, project_id, test_databricks=True, ignore_deployment_issues=bool(resume_run_id))
+    if not pre["eligible"]:
+        raise ValueError("DEV precheck blocked deployment: " + "; ".join(x["message"] for x in pre["blockers"]))
+
+    if resume_run_id:
+        run = db.get(MigrationRun, resume_run_id)
+        if not run or run.project_id != project_id or run.environment != "DEV":
+            raise ValueError("Resume run not found in project")
+        if run.status not in {"FAILED", "BLOCKED"}:
+            raise ValueError("Only FAILED/BLOCKED DEV runs can be resumed")
+        run.status = "RUNNING"; run.ended_at = None
+        run_id = run.id
+    else:
+        run = MigrationRun(id=uid("RUN"), project_id=project_id, stage="DEV_DEPLOYMENT", environment="DEV", status="RUNNING")
+        db.add(run); db.commit(); run_id = run.id
+
+    _deployment_evidence(db, project_id, run_id, "RUNNING", action="DEPLOY_APPROVED", destructive_approved=allow_destructive)
+    versions = _latest_current_versions(db, project_id)
+    object_ids = {obj.id for _, _, obj in versions}
+    order = _dependency_order(db, project_id, object_ids)
+    index = {obj.id: (art, av, obj) for art, av, obj in versions}
+
+    completed_ids: set[str] = set()
+    if resume_run_id:
+        prior = db.scalars(select(MigrationDeployment).where(
+            MigrationDeployment.project_id == project_id,
+            MigrationDeployment.environment == "DEV",
+            MigrationDeployment.status == "PASSED",
+        )).all()
+        for row in prior:
+            p = _payload(row)
+            if p.get("run_id") == run_id and row.object_id:
+                completed_ids.add(row.object_id)
+
+    results = []
+    failed_object = None
+    failure_stage = "DEV_DEPLOYMENT"
+    try:
+        for object_id in order:
+            art, av, obj = index[object_id]
+            failed_object = f"{obj.schema_name}.{obj.object_name}"
+            failure_stage = "MAPPING"
+            mapping = _mapping(db, project_id, object_id, "DEV")
+            if not mapping:
+                raise RuntimeError(f"DEV mapping missing for {obj.schema_name}.{obj.object_name}")
+            # Prevent one project from replacing a target previously owned by another project.
+            other_rows = db.scalars(select(MigrationDeployment).where(MigrationDeployment.project_id != project_id)).all()
+            for own in other_rows:
+                if _payload(own).get("target_fqn") == mapping.target_fqn and own.status == "PASSED":
+                    raise RuntimeError(f"Target ownership collision: {mapping.target_fqn} is already owned by project {own.project_id}")
+            catalog, schema, _ = _parse_target_fqn(mapping.target_fqn)
+            failure_stage = "TARGET_SCHEMA"
+            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            if object_id in completed_ids:
+                results.append({"object_id": object_id, "name": obj.object_name, "status": "SKIPPED_ALREADY_PASSED"})
+                continue
+            _record_step(db, project_id, run_id, "DEPLOY_OBJECT", "RUNNING", object_id, target=mapping.target_fqn, artifact_version=av.version)
+            failure_stage = "TARGET_SCHEMA_PREFLIGHT"
+            schema_action = None
+            if obj.object_type == "TABLE":
+                schema_action = _apply_table_schema_policy(db, project_id, obj, mapping, allow_destructive)
+                if schema_action["action"] == "CREATE":
+                    failure_stage = "DEPLOY_DDL"
+                    _safe_execute_artifact(av.content)
+                elif schema_action["action"] == "REPLACE":
+                    failure_stage = "GOVERNED_DEV_REPLACE"
+                    execute_sql(f"DROP TABLE {mapping.target_fqn}", safe_retry=False)
+                    failure_stage = "DEPLOY_DDL"
+                    _safe_execute_artifact(av.content)
+            else:
+                # CREATE OR REPLACE is safe for views/functions when already generated that way; raw destructive SQL remains blocked.
+                failure_stage = "DEPLOY_DDL"
+                _safe_execute_artifact(av.content)
+
+            failure_stage = "BRONZE_LOAD"
+            load_result = load_bronze_table(
+                db, project_id, obj, mapping, run_id,
+                batch_size or cfg.batch_size, max_rows if max_rows is not None else cfg.max_rows,
+                load_mode or cfg.load_mode, replace_existing_data,
+            )
+            _deployment_evidence(db, project_id, run_id, "PASSED", object_id=object_id,
+                                 target_fqn=mapping.target_fqn, artifact_version_id=av.id,
+                                 artifact_version=av.version, layer=mapping.target_layer,
+                                 schema_action=schema_action, load=load_result)
+            _record_step(db, project_id, run_id, "DEPLOY_OBJECT", "PASSED", object_id, target=mapping.target_fqn)
+            for issue in db.scalars(select(MigrationIssue).where(MigrationIssue.project_id==project_id, MigrationIssue.object_id==object_id, MigrationIssue.issue_type=="DEPLOYMENT", MigrationIssue.status=="OPEN")).all():
+                issue.status="RESOLVED"
+            db.commit()
+            results.append({"object_id": object_id, "name": obj.object_name, "status": "PASSED", "layer": mapping.target_layer, "load": load_result})
+
+        run.status = "PASSED"; run.ended_at = datetime.utcnow(); run.checkpoint = "DEV_DEPLOYMENT_COMPLETE"
+        db.commit()
+        _deployment_evidence(db, project_id, run_id, "PASSED", deployed=sum(1 for x in results if x["status"] == "PASSED"), failed=0)
+        return {"run_id": run_id, "status": "PASSED", "results": results, "failed_object": None}
+    except Exception as e:
+        classified = classify_execution_error(e, failure_stage)
+        run.status = "FAILED"; run.ended_at = datetime.utcnow(); run.checkpoint = failed_object
+        db.commit()
+        _deployment_evidence(
+            db, project_id, run_id, "FAILED", failed_object=failed_object, error=str(e),
+            error_category=classified["error_category"], error_code=classified["error_code"],
+            failure_stage=failure_stage, retryable=classified["retryable"],
+            deterministic_remediation_available=classified["deterministic_remediation_available"],
+            remediation=classified["recommended_action"],
+        )
+        if failed_object:
+            obj = next((o for _, _, o in versions if f"{o.schema_name}.{o.object_name}" == failed_object), None)
+            existing=db.scalars(select(MigrationIssue).where(
+                MigrationIssue.project_id==project_id, MigrationIssue.object_id==(obj.id if obj else None),
+                MigrationIssue.issue_type=="DEPLOYMENT", MigrationIssue.status=="OPEN"
+            )).first()
+            details=json.dumps({
+                "run_id":run_id, "failed_object":failed_object, "error":str(e),
+                "failure_stage":failure_stage, **classified,
+            }, default=str)
+            if existing:
+                existing.message=f"DEV deployment failed at {failed_object}"; existing.technical_details=details
+                existing.recommended_action=classified["recommended_action"]
+            else:
+                db.add(MigrationIssue(id=uid("ISS"), project_id=project_id, object_id=obj.id if obj else None,
+                                      issue_type="DEPLOYMENT", severity="BLOCKER", message=f"DEV deployment failed at {failed_object}",
+                                      technical_details=details, recommended_action=classified["recommended_action"]))
+            db.commit()
+        return {
+            "run_id": run_id, "status": "FAILED", "results": results, "failed_object": failed_object,
+            "error": str(e), "failure": classified,
+        }
+
+
+def latest_failed_dev_run(db: Session, project_id: str) -> MigrationRun | None:
+    return db.scalars(select(MigrationRun).where(
+        MigrationRun.project_id == project_id,
+        MigrationRun.environment == "DEV",
+        MigrationRun.stage == "DEV_DEPLOYMENT",
+        MigrationRun.status.in_(["FAILED", "BLOCKED"]),
+    ).order_by(MigrationRun.started_at.desc())).first()
+
+
+def run_reconciliation(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any]:
+    env = environment.upper()
+    run = db.scalars(select(MigrationRun).where(
+        MigrationRun.project_id == project_id,
+        MigrationRun.environment == env,
+        MigrationRun.stage == "DEV_DEPLOYMENT",
+        MigrationRun.status == "PASSED",
+    ).order_by(MigrationRun.started_at.desc())).first()
+    if not run:
+        raise ValueError(f"No PASSED {env} deployment run exists")
+
+    objects = db.scalars(select(MigrationObject).where(MigrationObject.project_id == project_id)).all()
+    details = []
+    passed = failed = 0
+    for obj in objects:
+        mapping = _mapping(db, project_id, obj.id, env)
+        if not mapping:
+            continue
+        status = "PASSED"; source_count = target_count = None; error = None
+        try:
+            target_rows = execute_sql(f"SELECT COUNT(*) FROM {mapping.target_fqn}", safe_retry=True)
+            target_count = int(target_rows[0][0]) if target_rows else 0
+            if obj.object_type == "TABLE":
+                src = db.get(MigrationSource, obj.source_id)
+                if not src:
+                    raise RuntimeError("Source profile missing")
+                import pyodbc
+                with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
+                    cur = conn.cursor(); cur.execute(f"SELECT COUNT(*) FROM [{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]")
+                    source_count = int(cur.fetchone()[0])
+                if source_count != target_count:
+                    status = "FAILED"
+        except Exception as e:
+            status = "FAILED"; error = str(e)
+        if status == "PASSED": passed += 1
+        else: failed += 1
+        item = {"object_id": obj.id, "object": f"{obj.schema_name}.{obj.object_name}", "layer": mapping.target_layer,
+                "reconciliation_type": "ROW_COUNT" if obj.object_type == "TABLE" else "TARGET_EXISTENCE_COUNT",
+                "source_count": source_count, "target_count": target_count, "status": status, "error": error}
+        details.append(item)
+        db.add(MigrationReconciliationDetail(id=uid("RCD"), project_id=project_id, object_id=obj.id,
+                                             environment=env, status=status, payload_json=_json({"run_id": run.id, **item})))
+    overall = "PASSED" if failed == 0 and details else "FAILED"
+    db.add(MigrationReconciliation(id=uid("REC"), project_id=project_id, environment=env, status=overall,
+                                   payload_json=_json({"run_id": run.id, "passed": passed, "failed": failed, "details_count": len(details)})))
+    db.commit()
+    return {"run_id": run.id, "status": overall, "passed": passed, "failed": failed, "details": details}
+
+
+def evaluate_dev_gate(db: Session, project_id: str) -> dict[str, Any]:
+    blockers: list[str] = []
+    deployment = db.scalars(select(MigrationRun).where(
+        MigrationRun.project_id == project_id, MigrationRun.environment == "DEV",
+        MigrationRun.stage == "DEV_DEPLOYMENT",
+    ).order_by(MigrationRun.started_at.desc())).first()
+    if not deployment or deployment.status != "PASSED":
+        blockers.append("Latest DEV deployment is not PASSED")
+
+    versions = _latest_current_versions(db, project_id)
+    for _, av, obj in versions:
+        if not _approved(db, project_id, av.id):
+            blockers.append(f"{obj.schema_name}.{obj.object_name} current artifact version is not approved")
+
+    open_issues = db.scalars(select(MigrationIssue).where(
+        MigrationIssue.project_id == project_id, MigrationIssue.status == "OPEN", MigrationIssue.severity == "BLOCKER"
+    )).all()
+    if open_issues:
+        blockers.append(f"{len(open_issues)} open blocker issue(s)")
+
+    recon = db.scalars(select(MigrationReconciliation).where(
+        MigrationReconciliation.project_id == project_id, MigrationReconciliation.environment == "DEV"
+    ).order_by(MigrationReconciliation.created_at.desc())).first()
+    if not recon or recon.status != "PASSED":
+        blockers.append("Latest DEV reconciliation is not PASSED")
+
+    status = "PASSED" if not blockers else "BLOCKED"
+    run = MigrationRun(id=uid("RUN"), project_id=project_id, stage="QUALITY_GATE", environment="DEV",
+                       status=status, ended_at=datetime.utcnow())
+    db.add(run); db.flush()
+    gate = MigrationQualityGate(id=uid("GAT"), project_id=project_id, run_id=run.id, environment="DEV", status=status,
+                                pass_count=3 if status == "PASSED" else max(0, 3-len(blockers)),
+                                fail_count=len(blockers), blocker_count=len(blockers),
+                                deployment_version=deployment.id if deployment else None)
+    db.add(gate); db.commit()
+    return {"gate_id": gate.id, "run_id": run.id, "status": status, "blockers": blockers,
+            "deployment_run_id": deployment.id if deployment else None}
+
+
+def deployment_status(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any]:
+    env = environment.upper()
+    run = db.scalars(select(MigrationRun).where(
+        MigrationRun.project_id == project_id,
+        MigrationRun.environment == env,
+        MigrationRun.stage == "DEV_DEPLOYMENT",
+    ).order_by(MigrationRun.started_at.desc())).first()
+    if not run:
+        return {"environment": env, "status": "NOT_STARTED", "run_id": None, "total": 0, "passed": 0, "failed": 0, "current_step": None, "failed_object": None, "logs": []}
+    evidence = db.scalars(select(MigrationDeployment).where(
+        MigrationDeployment.project_id == project_id, MigrationDeployment.environment == env,
+    ).order_by(MigrationDeployment.created_at.asc())).all()
+    relevant = [x for x in evidence if _payload(x).get("run_id") == run.id]
+    object_rows = [x for x in relevant if x.object_id]
+    logs = [{"status": x.status, "object_id": x.object_id, "created_at": x.created_at, **_payload(x)} for x in relevant[-50:]]
+    fail = next((x for x in reversed(logs) if x.get("status") == "FAILED"), None)
+    return {"environment": env, "status": run.status, "run_id": run.id, "started_at": run.started_at, "ended_at": run.ended_at,
+            "checkpoint": run.checkpoint, "total": len({x.object_id for x in object_rows}),
+            "passed": sum(1 for x in object_rows if x.status == "PASSED"),
+            "failed": sum(1 for x in object_rows if x.status == "FAILED"),
+            "current_step": run.checkpoint, "failed_object": fail.get("failed_object") if fail else None, "logs": logs}

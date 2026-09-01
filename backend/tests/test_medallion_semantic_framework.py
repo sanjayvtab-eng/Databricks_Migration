@@ -1,0 +1,156 @@
+
+def _project_with_semantics(client, auth_headers):
+    p=client.post('/api/projects',headers=auth_headers,json={'name':'Medallion Semantic Regression'}).json(); pid=p['id']
+    s=client.post(f'/api/projects/{pid}/sources',headers=auth_headers,json={'profile_name':'S1','server_name':'sql1','database_name':'SalesDB'}).json()
+    snap={'database':'SalesDB','objects':[
+        {'schema':'sales','name':'Customer','type':'TABLE','columns':[
+            {'name':'CustomerId','type':'int','nullable':False},{'name':'CustomerName','type':'nvarchar','nullable':False},{'name':'Region','type':'nvarchar','nullable':True}
+        ],'constraints':[{'name':'PK_Customer','type':'PRIMARY_KEY','columns':['CustomerId']}], 'approx_row_count':1000},
+        {'schema':'sales','name':'Product','type':'TABLE','columns':[
+            {'name':'ProductId','type':'int','nullable':False},{'name':'ProductName','type':'nvarchar','nullable':False},{'name':'Category','type':'nvarchar','nullable':True}
+        ],'constraints':[{'name':'PK_Product','type':'PRIMARY_KEY','columns':['ProductId']}], 'approx_row_count':100},
+        {'schema':'sales','name':'Sales','type':'TABLE','columns':[
+            {'name':'SaleId','type':'bigint','nullable':False},{'name':'CustomerId','type':'int','nullable':False},{'name':'ProductId','type':'int','nullable':False},
+            {'name':'SaleDate','type':'date','nullable':False},{'name':'Quantity','type':'int','nullable':False},{'name':'Amount','type':'decimal','precision':18,'scale':2,'nullable':False}
+        ],'constraints':[
+            {'name':'PK_Sales','type':'PRIMARY_KEY','columns':['SaleId']},
+            {'name':'FK_Sales_Customer','type':'FOREIGN_KEY','columns':['CustomerId'],'referenced_schema':'sales','referenced_object':'Customer','referenced_columns':['CustomerId']},
+            {'name':'FK_Sales_Product','type':'FOREIGN_KEY','columns':['ProductId'],'referenced_schema':'sales','referenced_object':'Product','referenced_columns':['ProductId']}
+        ], 'approx_row_count':1000000},
+        {'schema':'sales','name':'vw_SalesSummary','type':'VIEW','definition':'CREATE VIEW sales.vw_SalesSummary AS SELECT CustomerId, SUM(Amount) TotalAmount FROM sales.Sales GROUP BY CustomerId',
+         'columns':[{'name':'CustomerId','type':'int','nullable':False},{'name':'TotalAmount','type':'decimal','precision':18,'scale':2,'nullable':True}],
+         'dependencies':[{'schema':'sales','object':'Sales','type':'LOCAL'}]},
+        {'schema':'sales','name':'usp_LoadSales','type':'PROCEDURE','definition':'CREATE PROCEDURE sales.usp_LoadSales AS UPDATE sales.Sales SET Amount=Amount WHERE 1=0',
+         'dependencies':[{'schema':'sales','object':'Sales','type':'LOCAL'}]},
+        {'schema':'sales','name':'fn_SalesAmount','type':'FUNCTION','definition':'CREATE FUNCTION sales.fn_SalesAmount() RETURNS int AS BEGIN RETURN 1 END'},
+    ]}
+    assert client.post(f'/api/projects/{pid}/discovery/snapshot',headers=auth_headers,json={'source_id':s['id'],'snapshot':snap}).status_code==200
+    assert client.post(f'/api/projects/{pid}/classification',headers=auth_headers).status_code==200
+    assert client.post(f'/api/projects/{pid}/mappings',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'}).status_code==200
+    return pid
+
+
+def test_fact_dimension_inference_and_downstream_consumers(client,auth_headers):
+    pid=_project_with_semantics(client,auth_headers)
+    c=client.post(f'/api/projects/{pid}/consumers/analyze',headers=auth_headers)
+    assert c.status_code==200
+    rows=client.get(f'/api/projects/{pid}/consumers',headers=auth_headers).json()
+    sales=client.get(f'/api/projects/{pid}/inventory',headers=auth_headers).json()
+    sales_id=next(x['id'] for x in sales if x['name']=='Sales')
+    assert any(x['producer_object_id']==sales_id and x['consumer_name']=='sales.vw_SalesSummary' and x['usage_type']=='REPORTING_READ' for x in rows)
+
+    r=client.post(f'/api/projects/{pid}/semantics/infer',headers=auth_headers)
+    assert r.status_code==200
+    defs=r.json()['definitions']
+    assert next(x for x in defs if x['name']=='sales.Sales')['role']=='FACT'
+    assert next(x for x in defs if x['name']=='sales.Customer')['role']=='DIMENSION'
+    assert next(x for x in defs if x['name']=='sales.Product')['role']=='DIMENSION'
+
+
+def test_true_multistage_plan_and_gold_generation_from_approved_semantics(client,auth_headers):
+    pid=_project_with_semantics(client,auth_headers)
+    inventory=client.get(f'/api/projects/{pid}/inventory',headers=auth_headers).json()
+    sales_id=next(x['id'] for x in inventory if x['name']=='Sales')
+    customer_id=next(x['id'] for x in inventory if x['name']=='Customer')
+
+    # Explicit semantics are the source of truth for automatic Gold generation.
+    fact=client.post(f'/api/projects/{pid}/semantics',headers=auth_headers,json={
+        'object_id':sales_id,'semantic_role':'FACT','target_name':'fact_sales','grain':['SaleId'],
+        'dimension_keys':['CustomerId','ProductId'],'measures':[
+            {'name':'quantity','source_column':'Quantity','aggregation':'NONE'},
+            {'name':'amount','source_column':'Amount','aggregation':'NONE'}
+        ]
+    }); assert fact.status_code==200, fact.text
+    dim=client.post(f'/api/projects/{pid}/semantics',headers=auth_headers,json={
+        'object_id':customer_id,'semantic_role':'DIMENSION','target_name':'dim_customer','business_keys':['CustomerId'],
+        'attributes':['CustomerName','Region'],'scd_type':'1'
+    }); assert dim.status_code==200, dim.text
+    assert client.post(f"/api/projects/{pid}/semantics/{fact.json()['id']}/approve",headers=auth_headers,json={'actor':'architect'}).status_code==200
+    assert client.post(f"/api/projects/{pid}/semantics/{dim.json()['id']}/approve",headers=auth_headers,json={'actor':'architect'}).status_code==200
+
+    plan=client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'})
+    assert plan.status_code==200, plan.text
+    body=plan.json()
+    sales_nodes=[x for x in body['nodes'] if x['source_object_id']==sales_id]
+    assert {'SOURCE','BRONZE','SILVER','GOLD'}.issubset({x['layer'] for x in sales_nodes})
+    assert any(x['layer']=='GOLD' and x['model_role']=='FACT' and x['target_name']=='fact_sales' for x in sales_nodes)
+    customer_nodes=[x for x in body['nodes'] if x['source_object_id']==customer_id]
+    assert {'SOURCE','BRONZE','SILVER','GOLD'}.issubset({x['layer'] for x in customer_nodes})
+
+    gen=client.post(f'/api/projects/{pid}/medallion/generate?environment=DEV',headers=auth_headers)
+    assert gen.status_code==200, gen.text
+    arts=client.get(f'/api/projects/{pid}/medallion/artifacts?environment=DEV',headers=auth_headers).json()
+    fact_art=next(x for x in arts if x['target_fqn'].endswith('`fact_sales`'))
+    dim_art=next(x for x in arts if x['target_fqn'].endswith('`dim_customer`'))
+    assert fact_art['validation_status']=='PASSED' and fact_art['executable'] is True
+    assert '`migration_dev`.`silver`.`Sales`' in fact_art['content']
+    assert '`migration_dev`.`bronze`.`Sales`' not in fact_art['content']
+    assert dim_art['validation_status']=='PASSED' and '`migration_dev`.`silver`.`Customer`' in dim_art['content']
+
+
+def test_gold_is_not_created_from_unapproved_inference(client,auth_headers):
+    pid=_project_with_semantics(client,auth_headers)
+    client.post(f'/api/projects/{pid}/semantics/infer',headers=auth_headers)
+    plan=client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'}).json()
+    assert not [x for x in plan['nodes'] if x['layer']=='GOLD']
+    assert plan['policy']['gold_requires_approved_business_semantics'] is True
+
+
+def test_semantic_definition_blocks_unknown_columns(client,auth_headers):
+    pid=_project_with_semantics(client,auth_headers)
+    inventory=client.get(f'/api/projects/{pid}/inventory',headers=auth_headers).json()
+    sales_id=next(x['id'] for x in inventory if x['name']=='Sales')
+    r=client.post(f'/api/projects/{pid}/semantics',headers=auth_headers,json={
+        'object_id':sales_id,'semantic_role':'FACT','target_name':'fact_bad','grain':['DoesNotExist'],
+        'measures':[{'name':'amount','source_column':'Amount','aggregation':'SUM'}]
+    })
+    assert r.status_code==400 and 'unknown column' in r.text.lower()
+
+
+def test_routines_are_planned_as_logic_assets(client,auth_headers):
+    pid=_project_with_semantics(client,auth_headers)
+    plan=client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'}).json()
+    proc=next(x for x in plan['nodes'] if x['target_name']=='usp_LoadSales' and x['layer']=='SILVER')
+    func=next(x for x in plan['nodes'] if x['target_name']=='fn_SalesAmount' and x['layer']=='SILVER')
+    assert proc['node_type'] in {'SQL_PROCEDURE','ROUTINE_PLAN'}
+    assert proc['transformation']['intent']=='ETL_LOAD'
+    assert func['node_type'] in {'SQL_FUNCTION','FUNCTION_PLAN'}
+
+def test_medallion_dev_deployment_is_review_gated_and_layer_ordered(client,auth_headers,db,monkeypatch):
+    from app.services.medallion import deploy_medallion_dev
+    from app.models.entities import MigrationStageArtifactVersion
+    import app.services.databricks_client as dc
+    import app.services.deployment as dep
+
+    pid=_project_with_semantics(client,auth_headers)
+    inventory=client.get(f'/api/projects/{pid}/inventory',headers=auth_headers).json()
+    customer_id=next(x['id'] for x in inventory if x['name']=='Customer')
+    dim=client.post(f'/api/projects/{pid}/semantics',headers=auth_headers,json={
+        'object_id':customer_id,'semantic_role':'DIMENSION','target_name':'dim_customer',
+        'business_keys':['CustomerId'],'attributes':['CustomerName','Region'],'scd_type':'1'
+    }).json()
+    client.post(f"/api/projects/{pid}/semantics/{dim['id']}/approve",headers=auth_headers,json={'actor':'architect'})
+    client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'})
+    client.post(f'/api/projects/{pid}/medallion/generate?environment=DEV',headers=auth_headers)
+
+    # Deployment is blocked until every current Medallion artifact is human approved.
+    try:
+        deploy_medallion_dev(db,pid)
+        assert False, 'expected review gate blocker'
+    except ValueError as e:
+        assert 'not approved' in str(e).lower()
+
+    for row in db.query(MigrationStageArtifactVersion).filter_by(project_id=pid).all():
+        if row.executable and row.validation_status=='PASSED':
+            row.review_status='APPROVED'; row.reviewer='architect'
+    db.commit()
+
+    executed=[]
+    monkeypatch.setattr(dc,'execute_sql',lambda sql,safe_retry=False: executed.append(sql) or [])
+    monkeypatch.setattr(dep,'_apply_table_schema_policy',lambda *a,**k:{'action':'CREATE','schema_status':'MISSING'})
+    monkeypatch.setattr(dep,'load_bronze_table',lambda *a,**k:{'status':'PASSED','rows':10})
+    result=deploy_medallion_dev(db,pid)
+    assert result['status']=='PASSED'
+    layers=[x['layer'] for x in result['deployed']]
+    assert layers==sorted(layers,key=lambda x:{'BRONZE':1,'SILVER':2,'GOLD':3}[x])
+    assert 'GOLD' in layers and layers.index('GOLD')>layers.index('SILVER')>layers.index('BRONZE')
