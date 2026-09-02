@@ -349,20 +349,33 @@ def infer_semantics(db: Session, project_id: str, *, refresh_consumers: bool = T
         target_name = ("fact_" if role == "FACT" else "dim_" if role == "DIMENSION" else "entity_") + _clean_name(obj.object_name).lower()
         measure_specs = [{"name": m, "source_column": m, "aggregation": "NONE"} for m in measures]
 
-        existing = db.scalar(select(MigrationSemanticDefinition).where(
+        existing_rows = list(db.scalars(select(MigrationSemanticDefinition).where(
             MigrationSemanticDefinition.project_id == project_id,
             MigrationSemanticDefinition.object_id == obj.id,
-            MigrationSemanticDefinition.definition_source == "INFERRED",
-        ))
+        ).order_by(MigrationSemanticDefinition.created_at)).all())
+        approved = next((row for row in existing_rows if row.status == "APPROVED"), None)
+        explicit = next((row for row in existing_rows if row.definition_source == "EXPLICIT"), None)
+        existing = next((row for row in existing_rows if row.definition_source == "INFERRED"), None)
+        if not existing:
+            # Reuse an unapproved AI candidate as the working inference row. It will
+            # be refreshed deterministically first, then reconsidered by Hybrid V2.
+            existing = next((row for row in existing_rows
+                             if row.status != "APPROVED" and (row.definition_source or "").startswith("AI_ASSISTED_")), None)
         payload = {
             "fact_score": fact_score, "dimension_score": dim_score, "evidence": evidence,
             "outgoing_fk_count": len(fks), "incoming_fk_count": incoming_fk,
             "reporting_consumer_count": reporting_consumers,
             "approx_row_count": _table_stats(db, project_id, obj.id).get("approx_row_count"),
         }
-        if existing and existing.status == "APPROVED":
-            # Approved semantics are immutable until explicitly changed by a user action.
-            sem = existing
+        protected = approved or explicit
+        if protected:
+            # Approved and explicit semantics are governed records regardless of
+            # which inference engine created them. Preserve the canonical row and
+            # remove stale unapproved inference duplicates for the same object.
+            sem = protected
+            for duplicate in existing_rows:
+                if duplicate.id != sem.id and duplicate.status != "APPROVED":
+                    db.delete(duplicate)
         else:
             if not existing:
                 sem = MigrationSemanticDefinition(id=uid("SEM"), project_id=project_id, object_id=obj.id,
