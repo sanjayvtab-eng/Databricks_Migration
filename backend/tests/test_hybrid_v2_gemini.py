@@ -85,7 +85,7 @@ def test_t01_ai_disabled_deterministic_results_preserved(client, auth_headers):
             r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
     assert r.status_code == 200
     body = r.json()
-    assert body["engine"] == "HYBRID_V2_1"
+    assert body["engine"] == "HYBRID_V2_2"
     assert body["ai_attempted"] == 0
     assert not spy["called"]
 
@@ -130,7 +130,7 @@ def test_t02_deterministic_confident_no_ai_call(client, auth_headers):
         assert sales_def["status"] == "INFERRED"
         assert sales_def["definition_source"] == "INFERRED"
     # AI may be called for Customer/Product if ambiguous; just verify Sales was not re-inferred
-    assert body["engine"] == "HYBRID_V2_1"
+    assert body["engine"] == "HYBRID_V2_2"
 
 
 # Test 3: Valid Gemini recommendation stored as AI_RECOMMENDED
@@ -151,7 +151,7 @@ def test_t03_valid_gemini_recommendation_stored_as_ai_recommended(client, auth_h
     assert body["ai_recommended"] >= 1
     d = next(x for x in body["definitions"] if "AmbigTable" in (x.get("object_name") or ""))
     assert d["status"] == "AI_RECOMMENDED"
-    assert d["definition_source"] == "AI_ASSISTED_HYBRID_V2_1"
+    assert d["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
     assert d["semantic_role"] == "FACT"
     assert "Amount" in [m["source_column"] for m in (d.get("measures") or [])]
     ev = d.get("evidence") or {}
@@ -211,7 +211,7 @@ def test_t05_low_confidence_preserved_as_review_required(client, auth_headers):
     assert r.status_code == 200
     d = next(x for x in r.json()["definitions"] if "LowConf" in (x.get("object_name") or ""))
     assert d["status"] in ("REVIEW_REQUIRED", "INFERRED")
-    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_1"
+    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_2"
 
 
 # Test 6: ENTITY role - preserved as REVIEW_REQUIRED
@@ -228,7 +228,7 @@ def test_t06_entity_role_preserved_as_review_required(client, auth_headers):
     assert r.status_code == 200
     d = next(x for x in r.json()["definitions"] if "Mystery" in (x.get("object_name") or ""))
     assert d["status"] in ("REVIEW_REQUIRED", "INFERRED")
-    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_1"
+    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_2"
 
 
 # Test 7: APPROVED semantic immutable through re-inference
@@ -532,7 +532,7 @@ def test_t15_mixed_valid_invalid_valid_still_processed(client, auth_headers):
     b_defs = [d for d in body["definitions"] if "TableB" in (d.get("object_name") or "")]
     if b_defs:
         assert b_defs[0]["status"] == "AI_RECOMMENDED"
-        assert b_defs[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_1"
+        assert b_defs[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
     assert len(body["ai_errors"]) >= 1
 
 
@@ -548,13 +548,50 @@ def test_t16_invalid_column_is_automatically_corrected(client, auth_headers):
                "attributes": ["Customer Name"],
                "measures": [{"name": "sales", "source_column": "TotalSales", "aggregation": "SUM"}],
                "reasoning_summary": "Customer aggregate.", "conflicts": [], "missing_evidence": []}
-    corrected = {"role": "FACT", "confidence": 0.91, "grain": ["RecordID"],
-                 "business_keys": ["RecordID"], "dimension_keys": [], "attributes": [],
-                 "measures": [{"name": "sales", "source_column": "TotalSales", "aggregation": "SUM"}],
-                 "reasoning_summary": "Corrected using exact source columns.",
-                 "conflicts": [], "missing_evidence": []}
     prompts = []
+
+    def correcting_llm(prompt):
+        prompts.append(prompt)
+        return invalid, "GEMINI", "gemini-2.5-flash"
+
+    with patch("app.services.medallion.call_structured_llm", correcting_llm):
+        r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ai_corrected"] == 1
+    assert body["ai_retry_attempts"] == 0
+    assert body["ai_errors"] == []
+    assert len(prompts) == 1
+    semantic = next(d for d in body["definitions"] if "AmbigCorrection" in d["object_name"])
+    assert semantic["status"] == "AI_RECOMMENDED"
+    assert semantic["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
+    assert semantic["evidence"]["automatically_corrected"] is True
+    assert semantic["evidence"]["semantic_attempts"] == 1
+    assert semantic["attributes"] == []
+    assert semantic["evidence"]["safe_repairs"] == [{
+        "action": "REMOVED_UNKNOWN_OPTIONAL_COLUMN",
+        "field": "attributes",
+        "value": "Customer Name",
+    }]
+    assert body["ai_recommended"] >= 1
+
+
+def test_t17_critical_measure_column_requires_ai_correction(client, auth_headers):
+    objects = [{"schema": "dbo", "name": "AmbigCritical", "type": "TABLE",
+                "columns": [_col("RecordID", "int", False), _col("TxnDate", "date", False),
+                            _col("Amount", "decimal", False, 18, 2)],
+                "constraints": [_pk("PK_CR", ["RecordID"])]}]
+    pid = _create_project(client, auth_headers, "T17 Critical Correction", "DB17", objects)
+    invalid = {"role": "FACT", "confidence": 0.9, "grain": ["RecordID"],
+               "business_keys": ["RecordID"], "dimension_keys": [], "attributes": [],
+               "measures": [{"name": "amount", "source_column": "InventedAmount", "aggregation": "SUM"}],
+               "reasoning_summary": "Initial response.", "conflicts": [], "missing_evidence": []}
+    corrected = {**invalid,
+                 "measures": [{"name": "amount", "source_column": "Amount", "aggregation": "SUM"}],
+                 "reasoning_summary": "Corrected critical column."}
     responses = iter([invalid, corrected])
+    prompts = []
 
     def correcting_llm(prompt):
         prompts.append(prompt)
@@ -569,10 +606,7 @@ def test_t16_invalid_column_is_automatically_corrected(client, auth_headers):
     assert body["ai_retry_attempts"] == 1
     assert body["ai_errors"] == []
     assert "CORRECTION REQUIRED" in prompts[1]
-    assert '"RecordID"' in prompts[1]
-    semantic = next(d for d in body["definitions"] if "AmbigCorrection" in d["object_name"])
+    semantic = next(d for d in body["definitions"] if "AmbigCritical" in d["object_name"])
     assert semantic["status"] == "AI_RECOMMENDED"
-    assert semantic["definition_source"] == "AI_ASSISTED_HYBRID_V2_1"
-    assert semantic["evidence"]["automatically_corrected"] is True
-    assert semantic["evidence"]["semantic_attempts"] == 2
-    assert body["ai_recommended"] >= 1
+    assert semantic["measures"][0]["source_column"] == "Amount"
+    assert semantic["evidence"]["safe_repairs"] == []
