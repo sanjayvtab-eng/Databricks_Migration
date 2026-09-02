@@ -423,7 +423,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
     baseline = infer_semantics(db, project_id)
     cfg = get_settings()
     baseline.update({
-        "engine": "HYBRID_V2_1",
+        "engine": "HYBRID_V2_2",
         "ai_provider": cfg.llm_provider.upper().strip(),
         "ai_attempted": 0,
         "ai_recommended": 0,
@@ -557,10 +557,23 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                     if isinstance(val, list): return val
                     return [val]
 
+                safe_repairs: list[dict[str, Any]] = []
                 grain = [_resolve_col(v) for v in _as_list(raw.get("grain"))]
                 business_keys = [_resolve_col(v) for v in _as_list(raw.get("business_keys"))]
                 dimension_keys = [_resolve_col(v) for v in _as_list(raw.get("dimension_keys"))]
-                attributes = [_resolve_col(v) for v in _as_list(raw.get("attributes"))]
+                attributes: list[str] = []
+                for value in _as_list(raw.get("attributes")):
+                    resolved = names.get(str(value).strip().lower())
+                    if resolved is None:
+                        # Attributes are optional descriptive hints. Removing an invented
+                        # attribute is safe when all role-critical fields validate below.
+                        safe_repairs.append({
+                            "field": "attributes",
+                            "value": str(value),
+                            "action": "REMOVED_UNKNOWN_OPTIONAL_COLUMN",
+                        })
+                        continue
+                    attributes.append(resolved)
 
                 measures: list[dict] = []
                 for m in raw.get("measures") or []:
@@ -609,7 +622,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                 sem.attributes_json = _json(attributes)
                 sem.measures_json = _json(measures)
                 sem.scd_type = "1" if role == "DIMENSION" else None
-                sem.definition_source = "AI_ASSISTED_HYBRID_V2_1"
+                sem.definition_source = "AI_ASSISTED_HYBRID_V2_2"
                 sem.status = "AI_RECOMMENDED"
                 sem.confidence_score = confidence
                 sem.evidence_json = _json({
@@ -621,11 +634,12 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                     "missing_evidence": raw.get("missing_evidence") or [],
                     "column_validation": "PASSED",
                     "semantic_attempts": semantic_attempt,
-                    "automatically_corrected": semantic_attempt > 1,
+                    "automatically_corrected": semantic_attempt > 1 or bool(safe_repairs),
+                    "safe_repairs": safe_repairs,
                     "correction_history": correction_history,
                 })
                 baseline["ai_recommended"] += 1
-                if semantic_attempt > 1:
+                if semantic_attempt > 1 or safe_repairs:
                     baseline["ai_corrected"] += 1
                 break
 
@@ -664,8 +678,8 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
     baseline["definitions"] = list_semantics(db, project_id)
     baseline["review_required"] = sum(1 for x in baseline["definitions"] if x["status"] == "REVIEW_REQUIRED")
     baseline["policy"] = (
-        "Hybrid V2.1 is a governed accuracy improvement with deterministic fallback. "
-        "Invalid columns or structures receive up to two automatic correction attempts; strict validation still rejects unresolved recommendations. "
+        "Hybrid V2.2 validates, safely repairs, revalidates, then delivers recommendations with deterministic fallback. "
+        "Unknown optional attributes are removed with evidence; invalid keys, grain, measures or structures receive up to two correction attempts. "
         "AI results are AI_RECOMMENDED and never auto-approved or auto-deployed."
     )
     return baseline
