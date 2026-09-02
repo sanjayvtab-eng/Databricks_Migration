@@ -13,7 +13,31 @@ Design constraints:
 """
 from __future__ import annotations
 import json
+import pytest
 from unittest.mock import patch
+
+
+@pytest.fixture(autouse=True)
+def enable_llm_for_hybrid_tests():
+    """Exercise the AI branch by default without changing production defaults.
+
+    Individual tests can still override this fixture's patched setting (T01 verifies
+    the disabled path and T14 supplies a sentinel API key for redaction checks).
+    """
+    import app.core.config as cfg_mod
+
+    real = cfg_mod.get_settings()
+
+    class FakeOn:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @property
+        def llm_enabled(self):
+            return True
+
+    with patch("app.services.medallion.get_settings", return_value=FakeOn()):
+        yield
 
 
 def _col(name, dtype, nullable=True, precision=None, scale=None):
@@ -61,7 +85,7 @@ def test_t01_ai_disabled_deterministic_results_preserved(client, auth_headers):
             r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
     assert r.status_code == 200
     body = r.json()
-    assert body["engine"] == "HYBRID_V2"
+    assert body["engine"] == "HYBRID_V2_2"
     assert body["ai_attempted"] == 0
     assert not spy["called"]
 
@@ -106,7 +130,7 @@ def test_t02_deterministic_confident_no_ai_call(client, auth_headers):
         assert sales_def["status"] == "INFERRED"
         assert sales_def["definition_source"] == "INFERRED"
     # AI may be called for Customer/Product if ambiguous; just verify Sales was not re-inferred
-    assert body["engine"] == "HYBRID_V2"
+    assert body["engine"] == "HYBRID_V2_2"
 
 
 # Test 3: Valid Gemini recommendation stored as AI_RECOMMENDED
@@ -127,7 +151,7 @@ def test_t03_valid_gemini_recommendation_stored_as_ai_recommended(client, auth_h
     assert body["ai_recommended"] >= 1
     d = next(x for x in body["definitions"] if "AmbigTable" in (x.get("object_name") or ""))
     assert d["status"] == "AI_RECOMMENDED"
-    assert d["definition_source"] == "AI_ASSISTED_HYBRID_V2"
+    assert d["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
     assert d["semantic_role"] == "FACT"
     assert "Amount" in [m["source_column"] for m in (d.get("measures") or [])]
     ev = d.get("evidence") or {}
@@ -155,7 +179,8 @@ def test_t04_invented_column_rejected_per_object_remainder_continues(client, aut
             "dimension_keys": [], "attributes": [],
             "measures": [{"name": "revenue", "source_column": "Revenue", "aggregation": "SUM"}],
             "reasoning_summary": "Real transaction.", "conflicts": [], "missing_evidence": []}
-    call_seq = iter([(bad, "GEMINI", "g"), (good, "GEMINI", "g")])
+    call_seq = iter([(bad, "GEMINI", "g"), (bad, "GEMINI", "g"),
+                     (bad, "GEMINI", "g"), (good, "GEMINI", "g")])
     with patch("app.services.medallion.call_structured_llm", lambda p: next(call_seq)):
         r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
     assert r.status_code == 200
@@ -186,7 +211,7 @@ def test_t05_low_confidence_preserved_as_review_required(client, auth_headers):
     assert r.status_code == 200
     d = next(x for x in r.json()["definitions"] if "LowConf" in (x.get("object_name") or ""))
     assert d["status"] in ("REVIEW_REQUIRED", "INFERRED")
-    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2"
+    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_2"
 
 
 # Test 6: ENTITY role - preserved as REVIEW_REQUIRED
@@ -203,7 +228,7 @@ def test_t06_entity_role_preserved_as_review_required(client, auth_headers):
     assert r.status_code == 200
     d = next(x for x in r.json()["definitions"] if "Mystery" in (x.get("object_name") or ""))
     assert d["status"] in ("REVIEW_REQUIRED", "INFERRED")
-    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2"
+    assert d["definition_source"] != "AI_ASSISTED_HYBRID_V2_2"
 
 
 # Test 7: APPROVED semantic immutable through re-inference
@@ -238,6 +263,8 @@ def test_t07_approved_semantic_immutable_through_reinference(client, auth_header
     assert post["approved_at"] is not None
     assert post["definition_source"] == "EXPLICIT"
     assert post["confidence"] == 1.0
+    object_definitions = [d for d in r2.json()["definitions"] if d["object_id"] == obj_id]
+    assert len(object_definitions) == 1
 
 
 # Test 8: Project isolation
@@ -494,7 +521,7 @@ def test_t15_mixed_valid_invalid_valid_still_processed(client, auth_headers):
                "dimension_keys": [], "attributes": [],
                "measures": [{"name": "bmeasure", "source_column": "BMeasure", "aggregation": "SUM"}],
                "reasoning_summary": "Transaction with date and measure.", "conflicts": [], "missing_evidence": []}
-    responses = [invalid_a, valid_b]
+    responses = [invalid_a, invalid_a, invalid_a, valid_b]
     idx = {"i": 0}
     def ordered_llm(prompt):
         resp = responses[idx["i"]]; idx["i"] += 1; return resp, "GEMINI", "g"
@@ -507,6 +534,113 @@ def test_t15_mixed_valid_invalid_valid_still_processed(client, auth_headers):
     b_defs = [d for d in body["definitions"] if "TableB" in (d.get("object_name") or "")]
     if b_defs:
         assert b_defs[0]["status"] == "AI_RECOMMENDED"
-        assert b_defs[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2"
+        assert b_defs[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
     assert len(body["ai_errors"]) >= 1
+
+
+def test_t16_invalid_column_is_automatically_corrected(client, auth_headers):
+    objects = [{"schema": "dbo", "name": "AmbigCorrection", "type": "TABLE",
+                "columns": [_col("RecordID", "int", False),
+                            _col("TxnDate", "date", False),
+                            _col("TotalSales", "decimal", False, 18, 2)],
+                "constraints": [_pk("PK_AC", ["RecordID"])]}]
+    pid = _create_project(client, auth_headers, "T16 Auto Correction", "DB16", objects)
+    invalid = {"role": "FACT", "confidence": 0.90, "grain": ["RecordID"],
+               "business_keys": ["RecordID"], "dimension_keys": [],
+               "attributes": ["Customer Name"],
+               "measures": [{"name": "sales", "source_column": "TotalSales", "aggregation": "SUM"}],
+               "reasoning_summary": "Customer aggregate.", "conflicts": [], "missing_evidence": []}
+    prompts = []
+
+    def correcting_llm(prompt):
+        prompts.append(prompt)
+        return invalid, "GEMINI", "gemini-2.5-flash"
+
+    with patch("app.services.medallion.call_structured_llm", correcting_llm):
+        r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ai_corrected"] == 1
+    assert body["ai_retry_attempts"] == 0
+    assert body["ai_errors"] == []
+    assert len(prompts) == 1
+    semantic = next(d for d in body["definitions"] if "AmbigCorrection" in d["object_name"])
+    assert semantic["status"] == "AI_RECOMMENDED"
+    assert semantic["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
+    assert semantic["evidence"]["automatically_corrected"] is True
+    assert semantic["evidence"]["semantic_attempts"] == 1
+    assert semantic["attributes"] == []
+    assert semantic["evidence"]["safe_repairs"] == [{
+        "action": "REMOVED_UNKNOWN_OPTIONAL_COLUMN",
+        "field": "attributes",
+        "value": "Customer Name",
+    }]
     assert body["ai_recommended"] >= 1
+
+
+def test_t17_critical_measure_column_requires_ai_correction(client, auth_headers):
+    objects = [{"schema": "dbo", "name": "AmbigCritical", "type": "TABLE",
+                "columns": [_col("RecordID", "int", False), _col("TxnDate", "date", False),
+                            _col("Amount", "decimal", False, 18, 2)],
+                "constraints": [_pk("PK_CR", ["RecordID"])]}]
+    pid = _create_project(client, auth_headers, "T17 Critical Correction", "DB17", objects)
+    invalid = {"role": "FACT", "confidence": 0.9, "grain": ["RecordID"],
+               "business_keys": ["RecordID"], "dimension_keys": [], "attributes": [],
+               "measures": [{"name": "amount", "source_column": "InventedAmount", "aggregation": "SUM"}],
+               "reasoning_summary": "Initial response.", "conflicts": [], "missing_evidence": []}
+    corrected = {**invalid,
+                 "measures": [{"name": "amount", "source_column": "Amount", "aggregation": "SUM"}],
+                 "reasoning_summary": "Corrected critical column."}
+    responses = iter([invalid, corrected])
+    prompts = []
+
+    def correcting_llm(prompt):
+        prompts.append(prompt)
+        return next(responses), "GEMINI", "gemini-2.5-flash"
+
+    with patch("app.services.medallion.call_structured_llm", correcting_llm):
+        r = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ai_corrected"] == 1
+    assert body["ai_retry_attempts"] == 1
+    assert body["ai_errors"] == []
+    assert "CORRECTION REQUIRED" in prompts[1]
+    semantic = next(d for d in body["definitions"] if "AmbigCritical" in d["object_name"])
+    assert semantic["status"] == "AI_RECOMMENDED"
+    assert semantic["measures"][0]["source_column"] == "Amount"
+    assert semantic["evidence"]["safe_repairs"] == []
+
+
+def test_t18_approved_ai_semantic_does_not_create_deterministic_duplicate(client, auth_headers):
+    objects = [{"schema": "dbo", "name": "ApprovedAI", "type": "TABLE",
+                "columns": [_col("RecordID", "int", False), _col("TxnDate", "date", False),
+                            _col("Amount", "decimal", False, 18, 2)],
+                "constraints": [_pk("PK_AAI", ["RecordID"])]}]
+    pid = _create_project(client, auth_headers, "T18 AI Immutable", "DB18", objects)
+    valid = {"role": "FACT", "confidence": 0.91, "grain": ["RecordID"],
+             "business_keys": ["RecordID"], "dimension_keys": [], "attributes": [],
+             "measures": [{"name": "amount", "source_column": "Amount", "aggregation": "SUM"}],
+             "reasoning_summary": "Validated fact.", "conflicts": [], "missing_evidence": []}
+    with patch("app.services.medallion.call_structured_llm", return_value=(valid, "GEMINI", "g")):
+        first = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+    assert first.status_code == 200
+    candidate = next(d for d in first.json()["definitions"] if "ApprovedAI" in d["object_name"])
+    approved = client.post(f"/api/projects/{pid}/semantics/{candidate['id']}/approve",
+                           headers=auth_headers, json={"actor": "architect"})
+    assert approved.status_code == 200
+
+    def must_not_call_ai(*args, **kwargs):
+        raise AssertionError("Approved AI semantic must bypass re-inference")
+
+    with patch("app.services.medallion.call_structured_llm", must_not_call_ai):
+        second = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+
+    assert second.status_code == 200
+    definitions = [d for d in second.json()["definitions"] if d["object_id"] == candidate["object_id"]]
+    assert len(definitions) == 1
+    assert definitions[0]["id"] == candidate["id"]
+    assert definitions[0]["status"] == "APPROVED"
+    assert definitions[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
