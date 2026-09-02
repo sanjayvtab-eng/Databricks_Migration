@@ -1021,3 +1021,63 @@ def run_remediation_batch(
         "auto_deployed": False,
         "results": results,
     }
+
+
+def remediate_one_artifact(
+    db: Session,
+    project_id: str,
+    object_id: str,
+    *,
+    environment: str = "DEV",
+    use_ai: bool = True,
+    reviewer: str = "system",
+) -> dict[str, Any]:
+    """Create and statically validate one new artifact version without approving it."""
+    env = environment.upper()
+    if env != "DEV":
+        raise ValueError("Artifact remediation is currently restricted to DEV")
+    obj = db.get(MigrationObject, object_id)
+    if not obj or obj.project_id != project_id:
+        raise ValueError("Object not found in project")
+
+    plan = remediation_plan(db, project_id, env)
+    item = next((row for row in plan["items"] if row["object_id"] == object_id), None)
+    if not item:
+        raise ValueError("The current artifact version has no remediation blocker")
+    if not item["eligible"]:
+        raise ValueError(f"Artifact requires {item['route']} and cannot be repaired automatically")
+    if item.get("route") == "COMPATIBILITY_ENGINE":
+        raise ValueError("Runtime compatibility failures must be repaired and resumed from Deployments")
+
+    candidate = analyze_remediation(db, project_id, object_id, env, use_ai)
+    if not candidate["deterministic_validation"].get("valid"):
+        errors = candidate["deterministic_validation"].get("errors") or ["No safe executable candidate was produced"]
+        return {
+            "object_id": object_id,
+            "object_name": f"{obj.schema_name}.{obj.object_name}",
+            "status": "REVIEW_REQUIRED",
+            "ai_run_id": candidate["ai_run_id"],
+            "provider": candidate["provider"],
+            "errors": errors,
+            "approval_required": True,
+            "auto_approved": False,
+            "auto_deployed": False,
+        }
+
+    version = accept_remediation(db, project_id, object_id, candidate["ai_run_id"], reviewer)
+    validation = static_validate(db, project_id, object_id, env)
+    return {
+        "object_id": object_id,
+        "object_name": f"{obj.schema_name}.{obj.object_name}",
+        "status": "READY_FOR_REVIEW" if validation["valid"] else "VALIDATION_FAILED",
+        "ai_run_id": candidate["ai_run_id"],
+        "provider": candidate["provider"],
+        "confidence": candidate["confidence"],
+        "attempts": candidate.get("attempts", []),
+        "artifact_version_id": version.id,
+        "artifact_version": version.version,
+        "static_validation": validation,
+        "approval_required": True,
+        "auto_approved": False,
+        "auto_deployed": False,
+    }

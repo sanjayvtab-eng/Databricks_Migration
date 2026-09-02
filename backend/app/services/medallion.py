@@ -349,20 +349,33 @@ def infer_semantics(db: Session, project_id: str, *, refresh_consumers: bool = T
         target_name = ("fact_" if role == "FACT" else "dim_" if role == "DIMENSION" else "entity_") + _clean_name(obj.object_name).lower()
         measure_specs = [{"name": m, "source_column": m, "aggregation": "NONE"} for m in measures]
 
-        existing = db.scalar(select(MigrationSemanticDefinition).where(
+        existing_rows = list(db.scalars(select(MigrationSemanticDefinition).where(
             MigrationSemanticDefinition.project_id == project_id,
             MigrationSemanticDefinition.object_id == obj.id,
-            MigrationSemanticDefinition.definition_source == "INFERRED",
-        ))
+        ).order_by(MigrationSemanticDefinition.created_at)).all())
+        approved = next((row for row in existing_rows if row.status == "APPROVED"), None)
+        explicit = next((row for row in existing_rows if row.definition_source == "EXPLICIT"), None)
+        existing = next((row for row in existing_rows if row.definition_source == "INFERRED"), None)
+        if not existing:
+            # Reuse an unapproved AI candidate as the working inference row. It will
+            # be refreshed deterministically first, then reconsidered by Hybrid V2.
+            existing = next((row for row in existing_rows
+                             if row.status != "APPROVED" and (row.definition_source or "").startswith("AI_ASSISTED_")), None)
         payload = {
             "fact_score": fact_score, "dimension_score": dim_score, "evidence": evidence,
             "outgoing_fk_count": len(fks), "incoming_fk_count": incoming_fk,
             "reporting_consumer_count": reporting_consumers,
             "approx_row_count": _table_stats(db, project_id, obj.id).get("approx_row_count"),
         }
-        if existing and existing.status == "APPROVED":
-            # Approved semantics are immutable until explicitly changed by a user action.
-            sem = existing
+        protected = approved or explicit
+        if protected:
+            # Approved and explicit semantics are governed records regardless of
+            # which inference engine created them. Preserve the canonical row and
+            # remove stale unapproved inference duplicates for the same object.
+            sem = protected
+            for duplicate in existing_rows:
+                if duplicate.id != sem.id and duplicate.status != "APPROVED":
+                    db.delete(duplicate)
         else:
             if not existing:
                 sem = MigrationSemanticDefinition(id=uid("SEM"), project_id=project_id, object_id=obj.id,
@@ -423,10 +436,12 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
     baseline = infer_semantics(db, project_id)
     cfg = get_settings()
     baseline.update({
-        "engine": "HYBRID_V2",
+        "engine": "HYBRID_V2_2",
         "ai_provider": cfg.llm_provider.upper().strip(),
         "ai_attempted": 0,
         "ai_recommended": 0,
+        "ai_corrected": 0,
+        "ai_retry_attempts": 0,
         "ai_errors": [],
     })
     if not cfg.llm_enabled:
@@ -521,117 +536,163 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
         )
 
         baseline["ai_attempted"] += 1
-        try:
-            raw, provider, model = call_structured_llm(prompt)
+        correction_history: list[dict[str, Any]] = []
+        request_prompt = prompt
+        semantic_attempt_limit = min(3, max(1, cfg.llm_max_attempts))
+        for semantic_attempt in range(1, semantic_attempt_limit + 1):
+            if semantic_attempt > 1:
+                baseline["ai_retry_attempts"] += 1
+            try:
+                raw, provider, model = call_structured_llm(request_prompt)
 
-            role = str(raw.get("role") or "ENTITY").upper().strip()
-            if role not in SEMANTIC_ROLES:
-                raise ValueError(f"Unsupported semantic role returned by AI: {role!r}")
+                role = str(raw.get("role") or "ENTITY").upper().strip()
+                if role not in SEMANTIC_ROLES:
+                    raise ValueError(f"Unsupported semantic role returned by AI: {role!r}")
 
-            confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0)))
+                confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0)))
 
             # Correction 3: Strict column validation per object.
             # Any invented column raises ValueError → falls back to REVIEW_REQUIRED for this
             # object and continues processing the remaining objects (not a total failure).
-            def _resolve_col(value: str) -> str:
-                """Resolve a column name against discovered columns; raise on invented names."""
-                resolved = names.get(str(value).lower())
-                if resolved is None:
-                    raise ValueError(
-                        f"AI returned column {value!r} which does not exist in the discovered "
-                        f"schema for {obj.schema_name}.{obj.object_name}. Recommendation rejected."
-                    )
-                return resolved
+                def _resolve_col(value: str) -> str:
+                    """Resolve a column name against discovered columns; raise on invented names."""
+                    resolved = names.get(str(value).strip().lower())
+                    if resolved is None:
+                        raise ValueError(
+                            f"AI returned column {value!r} which does not exist in the discovered "
+                            f"schema for {obj.schema_name}.{obj.object_name}."
+                        )
+                    return resolved
 
-            def _as_list(val) -> list:
-                if val is None: return []
-                if isinstance(val, str): return [val]
-                if isinstance(val, list): return val
-                return [val]
+                def _as_list(val) -> list:
+                    if val is None: return []
+                    if isinstance(val, str): return [val]
+                    if isinstance(val, list): return val
+                    return [val]
 
-            grain = [_resolve_col(v) for v in _as_list(raw.get("grain"))]
-            business_keys = [_resolve_col(v) for v in _as_list(raw.get("business_keys"))]
-            dimension_keys = [_resolve_col(v) for v in _as_list(raw.get("dimension_keys"))]
-            attributes = [_resolve_col(v) for v in _as_list(raw.get("attributes"))]
+                safe_repairs: list[dict[str, Any]] = []
+                grain = [_resolve_col(v) for v in _as_list(raw.get("grain"))]
+                business_keys = [_resolve_col(v) for v in _as_list(raw.get("business_keys"))]
+                dimension_keys = [_resolve_col(v) for v in _as_list(raw.get("dimension_keys"))]
+                attributes: list[str] = []
+                for value in _as_list(raw.get("attributes")):
+                    resolved = names.get(str(value).strip().lower())
+                    if resolved is None:
+                        # Attributes are optional descriptive hints. Removing an invented
+                        # attribute is safe when all role-critical fields validate below.
+                        safe_repairs.append({
+                            "field": "attributes",
+                            "value": str(value),
+                            "action": "REMOVED_UNKNOWN_OPTIONAL_COLUMN",
+                        })
+                        continue
+                    attributes.append(resolved)
 
-            measures: list[dict] = []
-            for m in raw.get("measures") or []:
-                if not isinstance(m, dict):
-                    continue
-                source = _resolve_col(str(m.get("source_column") or ""))
-                measures.append({
-                    "name": str(m.get("name") or source),
-                    "source_column": source,
-                    "aggregation": str(m.get("aggregation") or "NONE").upper(),
-                })
+                measures: list[dict] = []
+                for m in raw.get("measures") or []:
+                    if not isinstance(m, dict):
+                        continue
+                    source = _resolve_col(str(m.get("source_column") or ""))
+                    measures.append({
+                        "name": str(m.get("name") or source),
+                        "source_column": source,
+                        "aggregation": str(m.get("aggregation") or "NONE").upper(),
+                    })
 
             # Low confidence or ENTITY → preserve REVIEW_REQUIRED, do not store.
-            if role == "ENTITY" or confidence < 0.75:
-                continue
+                if role == "ENTITY" or confidence < 0.75:
+                    break
 
             # Structural role requirements.
-            if role == "FACT" and (not grain or not measures):
-                raise ValueError(f"AI recommended FACT for {obj.object_name} but grain or measures are missing after column validation.")
-            if role == "DIMENSION" and not business_keys:
-                raise ValueError(f"AI recommended DIMENSION for {obj.object_name} but business_keys are missing after column validation.")
-            if role in {"AGGREGATE", "KPI"} and not measures:
-                raise ValueError(f"AI recommended {role} for {obj.object_name} but measures are missing after column validation.")
+                if role == "FACT" and (not grain or not measures):
+                    raise ValueError(f"AI recommended FACT for {obj.object_name} but grain or measures are missing after column validation.")
+                if role == "DIMENSION" and not business_keys:
+                    raise ValueError(f"AI recommended DIMENSION for {obj.object_name} but business_keys are missing after column validation.")
+                if role in {"AGGREGATE", "KPI"} and not measures:
+                    raise ValueError(f"AI recommended {role} for {obj.object_name} but measures are missing after column validation.")
 
             # Deduplicate lists preserving order.
-            def _dedup(lst: list) -> list:
-                seen: set = set(); out = []
-                for x in lst:
-                    if x not in seen:
-                        seen.add(x); out.append(x)
-                return out
+                def _dedup(lst: list) -> list:
+                    seen: set = set(); out = []
+                    for x in lst:
+                        if x not in seen:
+                            seen.add(x); out.append(x)
+                    return out
 
-            grain = _dedup(grain)
-            business_keys = _dedup(business_keys)
-            dimension_keys = _dedup(dimension_keys)
-            attributes = _dedup(attributes)
+                grain = _dedup(grain)
+                business_keys = _dedup(business_keys)
+                dimension_keys = _dedup(dimension_keys)
+                attributes = _dedup(attributes)
 
-            sem.semantic_role = role
-            sem.target_name = (
-                ("fact_" if role == "FACT" else "dim_" if role == "DIMENSION" else "gold_")
-                + _clean_name(obj.object_name).lower()
-            )
-            sem.grain_json = _json(grain)
-            sem.business_keys_json = _json(business_keys)
-            sem.dimension_keys_json = _json(dimension_keys)
-            sem.attributes_json = _json(attributes)
-            sem.measures_json = _json(measures)
-            sem.scd_type = "1" if role == "DIMENSION" else None
-            sem.definition_source = "AI_ASSISTED_HYBRID_V2"
-            sem.status = "AI_RECOMMENDED"
-            sem.confidence_score = confidence
-            sem.evidence_json = _json({
-                "provider": provider,
-                "model": model,
-                "deterministic": item.get("evidence"),
-                "reasoning_summary": raw.get("reasoning_summary"),
-                "conflicts": raw.get("conflicts") or [],
-                "missing_evidence": raw.get("missing_evidence") or [],
-                "column_validation": "PASSED",
-            })
-            baseline["ai_recommended"] += 1
+                sem.semantic_role = role
+                sem.target_name = (
+                    ("fact_" if role == "FACT" else "dim_" if role == "DIMENSION" else "gold_")
+                    + _clean_name(obj.object_name).lower()
+                )
+                sem.grain_json = _json(grain)
+                sem.business_keys_json = _json(business_keys)
+                sem.dimension_keys_json = _json(dimension_keys)
+                sem.attributes_json = _json(attributes)
+                sem.measures_json = _json(measures)
+                sem.scd_type = "1" if role == "DIMENSION" else None
+                sem.definition_source = "AI_ASSISTED_HYBRID_V2_2"
+                sem.status = "AI_RECOMMENDED"
+                sem.confidence_score = confidence
+                sem.evidence_json = _json({
+                    "provider": provider,
+                    "model": model,
+                    "deterministic": item.get("evidence"),
+                    "reasoning_summary": raw.get("reasoning_summary"),
+                    "conflicts": raw.get("conflicts") or [],
+                    "missing_evidence": raw.get("missing_evidence") or [],
+                    "column_validation": "PASSED",
+                    "semantic_attempts": semantic_attempt,
+                    "automatically_corrected": semantic_attempt > 1 or bool(safe_repairs),
+                    "safe_repairs": safe_repairs,
+                    "correction_history": correction_history,
+                })
+                baseline["ai_recommended"] += 1
+                if semantic_attempt > 1 or safe_repairs:
+                    baseline["ai_corrected"] += 1
+                break
 
-        except Exception as exc:
-            # Correction 2: Sanitize all provider exceptions; the API key must never appear
-            # in ai_errors, logs, API responses, UI messages, or downloaded logs.
-            safe_err = _sanitize_error(exc)
-            baseline["ai_errors"].append({
-                "object": f"{obj.schema_name}.{obj.object_name}",
-                "error": safe_err,
-            })
-            # Correction 3: Continue processing remaining objects.
-            continue
+            except ValueError as exc:
+                safe_err = _sanitize_error(exc)
+                correction_history.append({"attempt": semantic_attempt, "validation_error": safe_err})
+                if semantic_attempt >= semantic_attempt_limit:
+                    baseline["ai_errors"].append({
+                        "object": f"{obj.schema_name}.{obj.object_name}",
+                        "error": safe_err,
+                        "attempts": semantic_attempt,
+                    })
+                    break
+                valid_columns = [c.column_name for c in cols]
+                request_prompt = (
+                    prompt
+                    + "\n\nCORRECTION REQUIRED. Your previous JSON failed deterministic validation.\n"
+                    + f"Validation error: {safe_err}\n"
+                    + "Use only these exact, case-preserved source column names: "
+                    + json.dumps(valid_columns)
+                    + "\nDo not use friendly labels, derived names, table names, spaces not present in the list, "
+                      "or any other column. Correct structural omissions too. Return the complete corrected JSON only.\n"
+                    + "Previous response:\n"
+                    + json.dumps(raw, default=str)[:12000]
+                )
+            except Exception as exc:
+                safe_err = _sanitize_error(exc)
+                baseline["ai_errors"].append({
+                    "object": f"{obj.schema_name}.{obj.object_name}",
+                    "error": safe_err,
+                    "attempts": semantic_attempt,
+                })
+                break
 
     db.commit()
     baseline["definitions"] = list_semantics(db, project_id)
     baseline["review_required"] = sum(1 for x in baseline["definitions"] if x["status"] == "REVIEW_REQUIRED")
     baseline["policy"] = (
-        "Hybrid V2 is a governed accuracy improvement with deterministic fallback. "
-        "Column validation is strict: any invented column rejects the entire AI recommendation for that object. "
+        "Hybrid V2.2 validates, safely repairs, revalidates, then delivers recommendations with deterministic fallback. "
+        "Unknown optional attributes are removed with evidence; invalid keys, grain, measures or structures receive up to two correction attempts. "
         "AI results are AI_RECOMMENDED and never auto-approved or auto-deployed."
     )
     return baseline

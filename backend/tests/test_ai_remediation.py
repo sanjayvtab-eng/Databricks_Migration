@@ -1,6 +1,6 @@
 from sqlalchemy import select
 from app.services.engine import ensure_project, add_source, ingest_snapshot, classify_project, create_mappings, generate_artifact
-from app.services.ai_remediation import analyze_remediation, accept_remediation, remediation_plan, run_remediation_batch, validate_candidate_content
+from app.services.ai_remediation import analyze_remediation, accept_remediation, remediation_plan, remediate_one_artifact, run_remediation_batch, validate_candidate_content
 from app.models.entities import MigrationObject, MigrationArtifact, MigrationArtifactVersion, MigrationReview, MigrationMapping, MigrationIssue
 
 
@@ -62,6 +62,23 @@ def test_batch_remediation_creates_validated_version_but_never_approves(db):
     av=db.scalar(select(MigrationArtifactVersion).where(MigrationArtifactVersion.artifact_id==art.id,MigrationArtifactVersion.version==2))
     assert av.generator_version=='enterprise-2.0-ai-repair-loop'
     assert db.scalar(select(MigrationReview).where(MigrationReview.artifact_version_id==av.id)) is None
+
+
+def test_single_artifact_repair_creates_validated_unapproved_version(db):
+    p,obj=_seed(db)
+    result=remediate_one_artifact(
+        db,p.id,obj.id,environment='DEV',use_ai=False,reviewer='architect'
+    )
+    assert result['status']=='READY_FOR_REVIEW'
+    assert result['artifact_version']==2
+    assert result['static_validation']['status']=='PASSED'
+    assert result['approval_required'] is True
+    assert result['auto_approved'] is False
+    assert result['auto_deployed'] is False
+    assert db.scalar(select(MigrationReview).where(
+        MigrationReview.artifact_version_id==result['artifact_version_id'],
+        MigrationReview.status=='APPROVED',
+    )) is None
 
 
 def test_candidate_guard_rejects_destructive_and_source_references(db):

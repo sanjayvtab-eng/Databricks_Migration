@@ -26,6 +26,7 @@ from app.services.ai_remediation import (
     test_provider_connection,
     list_provider_models,
     remediation_plan,
+    remediate_one_artifact,
     run_remediation_batch,
 )
 import json
@@ -51,6 +52,10 @@ class RemediationBatchIn(BaseModel):
     apply_valid_candidates:bool=True
     reviewer:str="admin"
     max_objects:int=100
+class RemediationOneIn(BaseModel):
+    environment:str="DEV"
+    use_ai:bool=True
+    reviewer:str="admin"
 class IssueActionIn(BaseModel): action:str; comments:str
 
 class ConsumerIn(BaseModel):
@@ -536,6 +541,16 @@ def remediation_run_api(project_id:str,data:RemediationBatchIn,db:Session=Depend
         return run_remediation_batch(
             db,project_id,environment=data.environment,use_ai=data.use_ai,
             apply_valid_candidates=data.apply_valid_candidates,reviewer=reviewer,max_objects=data.max_objects,
+        )
+    except (ValueError,RuntimeError) as e:
+        raise HTTPException(400,str(e))
+
+@router.post("/projects/{project_id}/artifacts/{object_id}/remediation/repair")
+def remediation_repair_one_api(project_id:str,object_id:str,data:RemediationOneIn,db:Session=Depends(get_db),user=Depends(auth)):
+    try:
+        reviewer=data.reviewer.strip() or user.get("sub","unknown")
+        return remediate_one_artifact(
+            db,project_id,object_id,environment=data.environment,use_ai=data.use_ai,reviewer=reviewer,
         )
     except (ValueError,RuntimeError) as e:
         raise HTTPException(400,str(e))
