@@ -263,6 +263,8 @@ def test_t07_approved_semantic_immutable_through_reinference(client, auth_header
     assert post["approved_at"] is not None
     assert post["definition_source"] == "EXPLICIT"
     assert post["confidence"] == 1.0
+    object_definitions = [d for d in r2.json()["definitions"] if d["object_id"] == obj_id]
+    assert len(object_definitions) == 1
 
 
 # Test 8: Project isolation
@@ -610,3 +612,35 @@ def test_t17_critical_measure_column_requires_ai_correction(client, auth_headers
     assert semantic["status"] == "AI_RECOMMENDED"
     assert semantic["measures"][0]["source_column"] == "Amount"
     assert semantic["evidence"]["safe_repairs"] == []
+
+
+def test_t18_approved_ai_semantic_does_not_create_deterministic_duplicate(client, auth_headers):
+    objects = [{"schema": "dbo", "name": "ApprovedAI", "type": "TABLE",
+                "columns": [_col("RecordID", "int", False), _col("TxnDate", "date", False),
+                            _col("Amount", "decimal", False, 18, 2)],
+                "constraints": [_pk("PK_AAI", ["RecordID"])]}]
+    pid = _create_project(client, auth_headers, "T18 AI Immutable", "DB18", objects)
+    valid = {"role": "FACT", "confidence": 0.91, "grain": ["RecordID"],
+             "business_keys": ["RecordID"], "dimension_keys": [], "attributes": [],
+             "measures": [{"name": "amount", "source_column": "Amount", "aggregation": "SUM"}],
+             "reasoning_summary": "Validated fact.", "conflicts": [], "missing_evidence": []}
+    with patch("app.services.medallion.call_structured_llm", return_value=(valid, "GEMINI", "g")):
+        first = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+    assert first.status_code == 200
+    candidate = next(d for d in first.json()["definitions"] if "ApprovedAI" in d["object_name"])
+    approved = client.post(f"/api/projects/{pid}/semantics/{candidate['id']}/approve",
+                           headers=auth_headers, json={"actor": "architect"})
+    assert approved.status_code == 200
+
+    def must_not_call_ai(*args, **kwargs):
+        raise AssertionError("Approved AI semantic must bypass re-inference")
+
+    with patch("app.services.medallion.call_structured_llm", must_not_call_ai):
+        second = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+
+    assert second.status_code == 200
+    definitions = [d for d in second.json()["definitions"] if d["object_id"] == candidate["object_id"]]
+    assert len(definitions) == 1
+    assert definitions[0]["id"] == candidate["id"]
+    assert definitions[0]["status"] == "APPROVED"
+    assert definitions[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
