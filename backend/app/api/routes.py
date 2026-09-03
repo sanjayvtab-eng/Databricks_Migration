@@ -732,6 +732,41 @@ def deployment_logs_download(project_id:str,format:str="csv",db:Session=Depends(
     return Response(content=out.getvalue(),media_type="text/csv",headers={"Content-Disposition":f'attachment; filename="migration_dev_logs_{stamp}.csv"'})
 
 
+def _medallion_run_log_rows(db:Session,project_id:str,run_id:str) -> list[dict]:
+    return [row for row in _dev_log_rows(db,project_id)
+            if row.get("run_id")==run_id and (row.get("details") or {}).get("medallion_node_id")]
+
+
+@router.get("/projects/{project_id}/medallion/deployments/{run_id}/logs")
+def medallion_deployment_logs(project_id:str,run_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    rows=_medallion_run_log_rows(db,project_id,run_id)
+    return {
+        "project_id":project_id,"environment":"DEV","run_id":run_id,"count":len(rows),
+        "passed":sum(1 for row in rows if row.get("status")=="PASSED"),
+        "failed":sum(1 for row in rows if row.get("status")=="FAILED"),"logs":rows,
+    }
+
+
+@router.get("/projects/{project_id}/medallion/deployments/{run_id}/logs/download")
+def medallion_deployment_logs_download(project_id:str,run_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    rows=_medallion_run_log_rows(db,project_id,run_id)
+    out=io.StringIO(); writer=csv.writer(out)
+    writer.writerow(["timestamp","run_id","status","layer","target_fqn","artifact_version_id","object_id","error","details_json"])
+    for row in rows:
+        details=row.get("details") or {}
+        writer.writerow([
+            row.get("timestamp"),run_id,row.get("status"),details.get("layer"),row.get("target_fqn"),
+            details.get("artifact_version_id"),row.get("object_id"),details.get("error") or row.get("message"),
+            json.dumps(details,default=str,sort_keys=True),
+        ])
+    return Response(
+        content=out.getvalue(),media_type="text/csv",
+        headers={"Content-Disposition":f'attachment; filename="medallion_{run_id}_logs.csv"'},
+    )
+
+
 class RecordIn(BaseModel):
     title:str
     status:str="OPEN"

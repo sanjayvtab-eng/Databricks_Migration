@@ -154,3 +154,13 @@ def test_medallion_dev_deployment_is_review_gated_and_layer_ordered(client,auth_
     layers=[x['layer'] for x in result['deployed']]
     assert layers==sorted(layers,key=lambda x:{'BRONZE':1,'SILVER':2,'GOLD':3}[x])
     assert 'GOLD' in layers and layers.index('GOLD')>layers.index('SILVER')>layers.index('BRONZE')
+
+    logs=client.get(f"/api/projects/{pid}/medallion/deployments/{result['run_id']}/logs",headers=auth_headers)
+    assert logs.status_code==200
+    assert logs.json()['count']==len(result['deployed'])
+    assert logs.json()['passed']==len(result['deployed'])
+    assert logs.json()['failed']==0
+    download=client.get(f"/api/projects/{pid}/medallion/deployments/{result['run_id']}/logs/download",headers=auth_headers)
+    assert download.status_code==200
+    assert 'text/csv' in download.headers['content-type']
+    assert 'target_fqn' in download.text
