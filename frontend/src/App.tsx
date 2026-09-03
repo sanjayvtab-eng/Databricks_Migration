@@ -2403,6 +2403,23 @@ export default function App() {
                         <pre>{a.content}</pre>
                         <div className="artifact-actions">
                           <button
+                            disabled={!pid || busy}
+                            onClick={() =>
+                              action(() =>
+                                api(`/projects/${pid}/artifacts`, {
+                                  method: "POST",
+                                  body: JSON.stringify({
+                                    object_id: a.object_id,
+                                    environment: "DEV",
+                                  }),
+                                }),
+                              )
+                            }
+                          >
+                            <RefreshCw size={14} />
+                            Regenerate this artifact
+                          </button>
+                          <button
                             onClick={() =>
                               action(() =>
                                 api(
