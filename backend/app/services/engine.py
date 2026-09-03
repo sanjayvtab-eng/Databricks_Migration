@@ -163,6 +163,17 @@ def _clean_routine_body(definition: str) -> str:
     return body.strip()
 
 
+def _rewrite_static_procedure_calls(body: str) -> str:
+    """Translate mapped, static T-SQL EXEC calls into Databricks SQL CALL syntax.
+
+    Dynamic EXEC remains untouched and is rejected by the procedure compatibility guard.
+    At this stage known source procedure names have already been replaced by quoted
+    three-part Databricks identifiers, which makes the bounded rewrite unambiguous.
+    """
+    pattern = r"(?im)\bEXEC(?:UTE)?\s+(`[^`]+`\.`[^`]+`\.`[^`]+`)\s*;"
+    return re.sub(pattern, lambda match: f"CALL {match.group(1)}();", body)
+
+
 def _convert_function(db: Session, project_id: str, o: MigrationObject, m: MigrationMapping, environment: str) -> tuple[str,bool,str]:
     definition=o.definition or ""
     params=_routine_parameters(db,project_id,o.id)
@@ -203,10 +214,11 @@ def _convert_procedure(db: Session, project_id: str, o: MigrationObject, m: Migr
     body=_clean_routine_body(definition)
     body=_replace_parameters(rewrite_common_tsql(body),params)
     body=_replace_known_references(db,project_id,environment,body)
+    body=_rewrite_static_procedure_calls(body)
     low=body.lower()
 
-    unsupported=("exec(","execute(","sp_executesql","openquery(","xp_","raiserror","throw ")
-    if any(x in low for x in unsupported):
+    unsupported=("sp_executesql","openquery(","xp_","raiserror","throw ")
+    if any(x in low for x in unsupported) or re.search(r"(?i)\bEXEC(?:UTE)?\b", body):
         reason=f"{intent} contains unsupported dynamic/external behavior; deterministic conversion stopped safely."
         return (f"-- PROCEDURE_CLASSIFICATION: {intent}\n-- RECOMMENDED_TARGET: {target}\n-- NON_EXECUTABLE: {reason}\n"+body,False,reason)
 

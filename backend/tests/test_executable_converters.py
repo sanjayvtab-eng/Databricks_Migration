@@ -11,6 +11,7 @@ def _seed_routines(db):
         {'schema':'dbo','name':'Orders','type':'TABLE','columns':[{'name':'OrderId','type':'int'},{'name':'CustomerId','type':'int'},{'name':'Amount','type':'decimal','precision':18,'scale':2}]},
         {'schema':'dbo','name':'fn_OrderTotal','type':'FUNCTION','definition':'CREATE FUNCTION dbo.fn_OrderTotal(@CustomerId int) RETURNS decimal(18,2) AS BEGIN RETURN (SELECT COALESCE(SUM(Amount),0) FROM dbo.Orders WHERE CustomerId=@CustomerId); END','parameters':[{'name':'@CustomerId','ordinal':1,'type':'int'}]},
         {'schema':'dbo','name':'usp_GetCustomerOrders','type':'PROCEDURE','definition':'CREATE PROCEDURE dbo.usp_GetCustomerOrders @CustomerId int AS BEGIN SET NOCOUNT ON; SELECT OrderId, Amount FROM dbo.Orders WHERE CustomerId=@CustomerId; END','parameters':[{'name':'@CustomerId','ordinal':1,'type':'int','is_output':False}]},
+        {'schema':'dbo','name':'usp_DailySalesETL','type':'PROCEDURE','definition':'CREATE PROCEDURE dbo.usp_DailySalesETL AS BEGIN EXEC dbo.usp_GetCustomerOrders; END','parameters':[]},
     ]}
     ingest_snapshot(db,p.id,s.id,snapshot); classify_project(db,p.id); create_mappings(db,p.id,'DEV','migration_dev')
     return p
@@ -27,6 +28,11 @@ def test_function_and_procedure_generate_executable_artifacts(db):
     assert 'CREATE OR REPLACE PROCEDURE' in sp.content
     assert 'LANGUAGE SQL' in sp.content
     assert '-- NON_EXECUTABLE:' not in sp.content
+
+    orchestration=generate_artifact(db,p.id,objs['usp_DailySalesETL'].id)
+    assert 'CALL `migration_dev`.`silver`.`usp_GetCustomerOrders`();' in orchestration.content
+    assert 'EXEC ' not in orchestration.content.upper()
+    assert '-- NON_EXECUTABLE:' not in orchestration.content
 
 
 def test_precheck_deduplicates_blockers(db):
