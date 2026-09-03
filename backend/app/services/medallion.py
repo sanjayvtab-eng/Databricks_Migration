@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.models.entities import (
     CanonicalRecord,
+    MigrationArtifact,
+    MigrationArtifactVersion,
     MigrationColumn,
     MigrationConsumer,
     MigrationDependency,
@@ -20,10 +22,12 @@ from app.models.entities import (
     MigrationMedallionNode,
     MigrationObject,
     MigrationProject,
+    MigrationReview,
     MigrationSemanticDefinition,
     MigrationStageArtifact,
     MigrationStageArtifactVersion,
 )
+from app.models.canonical import MigrationValidation
 from app.services.engine import (
     _convert_function,
     _convert_procedure,
@@ -1165,6 +1169,10 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
         )
         return content, bool(content.strip()), [] if content.strip() else ["View definition empty"]
     if node.layer == "SILVER" and obj and obj.object_type in {"PROCEDURE", "FUNCTION"}:
+        repaired = _approved_repaired_artifact(db, project_id, obj.id, environment)
+        if repaired:
+            content = _retarget_repaired_routine(repaired.content, obj.object_type, node.target_fqn)
+            return content, True, []
         # Use the deterministic routine converters but target the Medallion node rather than
         # the legacy one-object/one-layer mapping.
         transient = MigrationMapping(project_id=project_id, object_id=obj.id, source_fqn="", target_fqn=node.target_fqn,
@@ -1193,6 +1201,56 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
     return "-- NON_EXECUTABLE: Unsupported Medallion node", False, ["Unsupported Medallion node"]
 
 
+def _approved_repaired_artifact(
+    db: Session, project_id: str, object_id: str, environment: str
+) -> MigrationArtifactVersion | None:
+    """Return the effective current routine version only when it passed validation and approval."""
+    artifacts = list(db.scalars(select(MigrationArtifact).where(
+        MigrationArtifact.project_id == project_id,
+        MigrationArtifact.object_id == object_id,
+    )).all())
+    versions: list[MigrationArtifactVersion] = []
+    for artifact in artifacts:
+        version = db.scalar(select(MigrationArtifactVersion).where(
+            MigrationArtifactVersion.project_id == project_id,
+            MigrationArtifactVersion.artifact_id == artifact.id,
+            MigrationArtifactVersion.version == artifact.current_version,
+        ))
+        if version:
+            versions.append(version)
+    current = max(versions, key=lambda row: (row.created_at, row.version, row.id), default=None)
+    if not current or "-- NON_EXECUTABLE:" in current.content.upper() or "ARCHITECT_REVIEW_REQUIRED" in current.content.upper():
+        return None
+
+    validations = list(db.scalars(select(MigrationValidation).where(
+        MigrationValidation.project_id == project_id,
+        MigrationValidation.object_id == object_id,
+        MigrationValidation.environment == environment.upper(),
+    ).order_by(MigrationValidation.created_at.desc())).all())
+    validated = False
+    for row in validations:
+        payload = _loads(row.payload_json, {})
+        if payload.get("artifact_version_id") == current.id:
+            validated = row.status == "PASSED"
+            break
+    if not validated:
+        return None
+
+    review = db.scalars(select(MigrationReview).where(
+        MigrationReview.project_id == project_id,
+        MigrationReview.artifact_version_id == current.id,
+        MigrationReview.review_type == "ARCHITECT_REVIEW",
+    ).order_by(MigrationReview.reviewed_at.desc())).first()
+    return current if review and review.status == "APPROVED" else None
+
+
+def _retarget_repaired_routine(content: str, object_type: str, target_fqn: str) -> str:
+    kind = "FUNCTION" if object_type == "FUNCTION" else "PROCEDURE"
+    pattern = rf"(?is)^\s*CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?{kind}\s+[^\s(]+"
+    replacement = f"CREATE OR REPLACE {kind} {target_fqn}"
+    return re.sub(pattern, lambda _: replacement, content, count=1)
+
+
 def generate_medallion_artifacts(db: Session, project_id: str, *, environment: str = "DEV") -> dict[str, Any]:
     env = environment.upper()
     nodes = list(db.scalars(select(MigrationMedallionNode).where(
@@ -1205,6 +1263,10 @@ def generate_medallion_artifacts(db: Session, project_id: str, *, environment: s
     generated = []
     for node in nodes:
         content, executable, errors = _stage_content(db, project_id, node, env)
+        source_version = None
+        source_obj = db.get(MigrationObject, node.source_object_id) if node.source_object_id else None
+        if node.layer == "SILVER" and source_obj and source_obj.object_type in {"PROCEDURE", "FUNCTION"}:
+            source_version = _approved_repaired_artifact(db, project_id, source_obj.id, env)
         validation = "PASSED" if executable and not errors else "FAILED"
         art = db.scalar(select(MigrationStageArtifact).where(
             MigrationStageArtifact.project_id == project_id,
@@ -1227,7 +1289,12 @@ def generate_medallion_artifacts(db: Session, project_id: str, *, environment: s
                 id=uid("MSV"), project_id=project_id, artifact_id=art.id, node_id=node.id,
                 version=art.current_version + 1, content=content, content_hash=content_hash,
                 executable=executable, validation_status=validation,
-                validation_json=_json({"errors": errors, "node_id": node.id, "target_fqn": node.target_fqn}),
+                validation_json=_json({
+                    "errors": errors, "node_id": node.id, "target_fqn": node.target_fqn,
+                    "source_artifact_version_id": source_version.id if source_version else None,
+                    "source_artifact_version": source_version.version if source_version else None,
+                    "source_artifact_hash": source_version.target_hash if source_version else None,
+                }),
                 review_status="PENDING_REVIEW",
             )
             db.add(version); art.current_version = version.version

@@ -2,6 +2,7 @@ from sqlalchemy import select
 from app.services.engine import ensure_project, add_source, ingest_snapshot, classify_project, create_mappings, generate_artifact
 from app.services.ai_remediation import analyze_remediation, accept_remediation, remediation_plan, remediate_one_artifact, run_remediation_batch, validate_candidate_content
 from app.models.entities import MigrationObject, MigrationArtifact, MigrationArtifactVersion, MigrationReview, MigrationMapping, MigrationIssue
+from app.services.medallion import build_medallion_plan, generate_medallion_artifacts, list_medallion_artifacts
 
 
 def _seed(db):
@@ -79,6 +80,34 @@ def test_single_artifact_repair_creates_validated_unapproved_version(db):
         MigrationReview.artifact_version_id==result['artifact_version_id'],
         MigrationReview.status=='APPROVED',
     )) is None
+
+
+def test_medallion_regeneration_uses_latest_approved_repaired_routine(db):
+    p,obj=_seed(db)
+    build_medallion_plan(db,p.id,environment='DEV',catalog='migration_dev')
+    first=generate_medallion_artifacts(db,p.id,environment='DEV')
+    first_row=next(x for x in first['artifacts'] if x['target_fqn'].endswith('`fn_OrderTotal`'))
+    assert first_row['version']==1
+    assert first_row['validation_status']=='FAILED'
+
+    repaired=remediate_one_artifact(
+        db,p.id,obj.id,environment='DEV',use_ai=False,reviewer='architect'
+    )
+    db.add(MigrationReview(
+        id='REV_REPAIRED_ROUTINE',project_id=p.id,
+        artifact_version_id=repaired['artifact_version_id'],review_type='ARCHITECT_REVIEW',
+        status='APPROVED',reviewer='architect',comments='Approved repaired routine',
+    ))
+    db.commit()
+
+    second=generate_medallion_artifacts(db,p.id,environment='DEV')
+    second_row=next(x for x in second['artifacts'] if x['target_fqn'].endswith('`fn_OrderTotal`'))
+    assert second_row['version']==2
+    assert second_row['validation_status']=='PASSED'
+    assert second_row['review_status']=='PENDING_REVIEW'
+    listed=next(x for x in list_medallion_artifacts(db,p.id,environment='DEV') if x['target_fqn'].endswith('`fn_OrderTotal`'))
+    assert listed['validation']['source_artifact_version_id']==repaired['artifact_version_id']
+    assert listed['validation']['source_artifact_version']==2
 
 
 def test_candidate_guard_rejects_destructive_and_source_references(db):
