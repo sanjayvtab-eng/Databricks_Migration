@@ -13,9 +13,16 @@ def qident(v: str) -> str: return "`" + v.replace("`","``") + "`"
 
 
 def _retarget_view_header(content: str, target_fqn: str) -> str:
-    """Make a discovered view definition idempotent and target the governed DEV FQN."""
-    pattern = r"(?is)^\s*CREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?VIEW\s+[^\s(]+"
-    return re.sub(pattern, lambda _: f"CREATE OR REPLACE VIEW {target_fqn}", content, count=1)
+    """Make a discovered view definition idempotent and target the governed DEV FQN.
+
+    SQL Server commonly stores SET/GO session preambles before CREATE VIEW. They are not
+    executable Databricks view syntax, so start from the first static CREATE VIEW header.
+    """
+    pattern = r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?VIEW\s+[^\s(]+"
+    match = re.search(pattern, content)
+    if not match:
+        return content
+    return f"CREATE OR REPLACE VIEW {target_fqn}" + content[match.end():]
 
 def ensure_project(db: Session, name: str) -> MigrationProject:
     p = db.scalar(select(MigrationProject).where(MigrationProject.name==name))

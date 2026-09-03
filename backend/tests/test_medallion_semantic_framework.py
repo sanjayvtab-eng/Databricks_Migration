@@ -17,7 +17,7 @@ def _project_with_semantics(client, auth_headers):
             {'name':'FK_Sales_Customer','type':'FOREIGN_KEY','columns':['CustomerId'],'referenced_schema':'sales','referenced_object':'Customer','referenced_columns':['CustomerId']},
             {'name':'FK_Sales_Product','type':'FOREIGN_KEY','columns':['ProductId'],'referenced_schema':'sales','referenced_object':'Product','referenced_columns':['ProductId']}
         ], 'approx_row_count':1000000},
-        {'schema':'sales','name':'vw_SalesSummary','type':'VIEW','definition':'CREATE VIEW [sales].[vw_SalesSummary] AS SELECT CustomerId, SUM(Amount) TotalAmount FROM [sales].[Sales] GROUP BY CustomerId',
+        {'schema':'sales','name':'vw_SalesSummary','type':'VIEW','definition':'SET ANSI_NULLS ON\nGO\nSET QUOTED_IDENTIFIER ON\nGO\nCREATE VIEW [sales].[vw_SalesSummary] AS SELECT CustomerId, SUM(Amount) TotalAmount FROM [sales].[Sales] GROUP BY CustomerId',
          'columns':[{'name':'CustomerId','type':'int','nullable':False},{'name':'TotalAmount','type':'decimal','precision':18,'scale':2,'nullable':True}],
          'dependencies':[{'schema':'sales','object':'Sales','type':'LOCAL'}]},
         {'schema':'sales','name':'usp_LoadSales','type':'PROCEDURE','definition':'CREATE PROCEDURE sales.usp_LoadSales AS UPDATE sales.Sales SET Amount=Amount WHERE 1=0',
