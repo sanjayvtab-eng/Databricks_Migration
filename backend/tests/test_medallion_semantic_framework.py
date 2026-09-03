@@ -17,7 +17,7 @@ def _project_with_semantics(client, auth_headers):
             {'name':'FK_Sales_Customer','type':'FOREIGN_KEY','columns':['CustomerId'],'referenced_schema':'sales','referenced_object':'Customer','referenced_columns':['CustomerId']},
             {'name':'FK_Sales_Product','type':'FOREIGN_KEY','columns':['ProductId'],'referenced_schema':'sales','referenced_object':'Product','referenced_columns':['ProductId']}
         ], 'approx_row_count':1000000},
-        {'schema':'sales','name':'vw_SalesSummary','type':'VIEW','definition':'CREATE VIEW sales.vw_SalesSummary AS SELECT CustomerId, SUM(Amount) TotalAmount FROM sales.Sales GROUP BY CustomerId',
+        {'schema':'sales','name':'vw_SalesSummary','type':'VIEW','definition':'CREATE VIEW [sales].[vw_SalesSummary] AS SELECT CustomerId, SUM(Amount) TotalAmount FROM [sales].[Sales] GROUP BY CustomerId',
          'columns':[{'name':'CustomerId','type':'int','nullable':False},{'name':'TotalAmount','type':'decimal','precision':18,'scale':2,'nullable':True}],
          'dependencies':[{'schema':'sales','object':'Sales','type':'LOCAL'}]},
         {'schema':'sales','name':'usp_LoadSales','type':'PROCEDURE','definition':'CREATE PROCEDURE sales.usp_LoadSales AS UPDATE sales.Sales SET Amount=Amount WHERE 1=0',
@@ -80,6 +80,8 @@ def test_true_multistage_plan_and_gold_generation_from_approved_semantics(client
     gen=client.post(f'/api/projects/{pid}/medallion/generate?environment=DEV',headers=auth_headers)
     assert gen.status_code==200, gen.text
     arts=client.get(f'/api/projects/{pid}/medallion/artifacts?environment=DEV',headers=auth_headers).json()
+    view_art=next(x for x in arts if x['target_fqn'].endswith('`vw_SalesSummary`'))
+    assert view_art['content'].startswith('CREATE OR REPLACE VIEW `migration_dev`.`silver`.`vw_SalesSummary`')
     fact_art=next(x for x in arts if x['target_fqn'].endswith('`fact_sales`'))
     dim_art=next(x for x in arts if x['target_fqn'].endswith('`dim_customer`'))
     assert fact_art['validation_status']=='PASSED' and fact_art['executable'] is True

@@ -11,6 +11,12 @@ def uid(prefix: str) -> str: return f"{prefix}_{uuid.uuid4().hex}"
 def sha(text: str) -> str: return hashlib.sha256(text.encode()).hexdigest()
 def qident(v: str) -> str: return "`" + v.replace("`","``") + "`"
 
+
+def _retarget_view_header(content: str, target_fqn: str) -> str:
+    """Make a discovered view definition idempotent and target the governed DEV FQN."""
+    pattern = r"(?is)^\s*CREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?VIEW\s+[^\s(]+"
+    return re.sub(pattern, lambda _: f"CREATE OR REPLACE VIEW {target_fqn}", content, count=1)
+
 def ensure_project(db: Session, name: str) -> MigrationProject:
     p = db.scalar(select(MigrationProject).where(MigrationProject.name==name))
     if p: return p
@@ -257,13 +263,9 @@ def generate_artifact(db: Session, project_id: str, object_id: str, environment:
         # parser-assisted bounded reference replacement; only known object mappings are replaced
         content=_replace_known_references(db,project_id,environment,content)
         if o.object_type=="VIEW":
-            # Ensure the created object itself is the mapped Databricks FQN, not the SQL Server source name.
-            content=re.sub(
-                rf"(?is)^\s*CREATE\s+(?:OR\s+ALTER\s+)?VIEW\s+(?:`?{re.escape(o.schema_name)}`?\.)?`?{re.escape(o.object_name)}`?",
-                f"CREATE OR REPLACE VIEW {m.target_fqn}",
-                content,
-                count=1,
-            )
+            # Reference rewriting may already have replaced the source view identifier,
+            # so canonicalize the whole header rather than matching the old name again.
+            content=_retarget_view_header(content,m.target_fqn)
     art=db.scalar(select(MigrationArtifact).where(MigrationArtifact.project_id==project_id,MigrationArtifact.object_id==object_id))
     if not art:
         art=MigrationArtifact(id=uid("ART"),project_id=project_id,object_id=object_id,artifact_type=o.object_type,current_version=0); db.add(art); db.flush()

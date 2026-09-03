@@ -31,6 +31,7 @@ from app.models.canonical import MigrationValidation
 from app.services.engine import (
     _convert_function,
     _convert_procedure,
+    _retarget_view_header,
     qident,
     rewrite_common_tsql,
     uid,
@@ -1163,10 +1164,7 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
     if node.layer == "SILVER" and obj and obj.object_type == "VIEW":
         content = rewrite_common_tsql(obj.definition or "")
         content = _replace_source_references(db, project_id, environment, content, for_gold=False)
-        content = re.sub(
-            rf"(?is)^\s*CREATE\s+(?:OR\s+ALTER\s+)?VIEW\s+(?:`?{re.escape(obj.schema_name)}`?\.)?`?{re.escape(obj.object_name)}`?",
-            f"CREATE OR REPLACE VIEW {node.target_fqn}", content, count=1,
-        )
+        content = _retarget_view_header(content, node.target_fqn)
         return content, bool(content.strip()), [] if content.strip() else ["View definition empty"]
     if node.layer == "SILVER" and obj and obj.object_type in {"PROCEDURE", "FUNCTION"}:
         repaired = _approved_repaired_artifact(db, project_id, obj.id, environment)
