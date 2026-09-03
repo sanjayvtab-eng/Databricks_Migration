@@ -281,11 +281,12 @@ def dev_precheck(db: Session, project_id: str, test_databricks: bool = True, ign
     return result
 
 
-def _safe_execute_artifact(content: str) -> None:
-    # One artifact version is treated as a single governed statement/batch. Destructive statements are rejected here.
+def _safe_execute_artifact(content: str, *, allow_destructive: bool = False) -> None:
+    # One artifact version is treated as a single governed statement/batch. Destructive
+    # statements require the explicit, per-request DEV approval supplied by the operator.
     upper = content.upper()
     forbidden = ("DROP TABLE", "DROP VIEW", "DROP SCHEMA", "TRUNCATE TABLE", "DELETE FROM")
-    if any(x in upper for x in forbidden):
+    if any(x in upper for x in forbidden) and not allow_destructive:
         raise RuntimeError("Generated artifact contains a destructive statement; explicit governed replacement is required.")
     execute_sql(content, safe_retry=False)
 
@@ -456,16 +457,16 @@ def deploy_dev(db: Session, project_id: str, *, allow_destructive: bool = False,
                 schema_action = _apply_table_schema_policy(db, project_id, obj, mapping, allow_destructive)
                 if schema_action["action"] == "CREATE":
                     failure_stage = "DEPLOY_DDL"
-                    _safe_execute_artifact(av.content)
+                    _safe_execute_artifact(av.content, allow_destructive=allow_destructive)
                 elif schema_action["action"] == "REPLACE":
                     failure_stage = "GOVERNED_DEV_REPLACE"
                     execute_sql(f"DROP TABLE {mapping.target_fqn}", safe_retry=False)
                     failure_stage = "DEPLOY_DDL"
-                    _safe_execute_artifact(av.content)
+                    _safe_execute_artifact(av.content, allow_destructive=allow_destructive)
             else:
                 # CREATE OR REPLACE is safe for views/functions when already generated that way; raw destructive SQL remains blocked.
                 failure_stage = "DEPLOY_DDL"
-                _safe_execute_artifact(av.content)
+                _safe_execute_artifact(av.content, allow_destructive=allow_destructive)
 
             failure_stage = "BRONZE_LOAD"
             load_result = load_bronze_table(

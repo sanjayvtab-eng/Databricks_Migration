@@ -28,7 +28,7 @@ def test_dev_deployment_records_evidence_and_can_gate(db,monkeypatch):
     monkeypatch.setattr(deployment,'dev_precheck',lambda *a,**k:{'eligible':True,'blockers':[]})
     monkeypatch.setattr(deployment,'execute_sql',lambda *a,**k:[])
     monkeypatch.setattr(deployment,'_apply_table_schema_policy',lambda *a,**k:{'action':'CREATE','schema_status':'MISSING'})
-    monkeypatch.setattr(deployment,'_safe_execute_artifact',lambda content:None)
+    monkeypatch.setattr(deployment,'_safe_execute_artifact',lambda content,**kwargs:None)
     monkeypatch.setattr(deployment,'load_bronze_table',lambda *a,**k:{'status':'PASSED','rows':7})
     r=deployment.deploy_dev(db,p.id)
     assert r['status']=='PASSED'
@@ -46,8 +46,23 @@ def test_failed_run_preserves_state_for_resume(db,monkeypatch):
     monkeypatch.setattr(deployment,'dev_precheck',lambda *a,**k:{'eligible':True,'blockers':[]})
     monkeypatch.setattr(deployment,'execute_sql',lambda *a,**k:[])
     monkeypatch.setattr(deployment,'_apply_table_schema_policy',lambda *a,**k:{'action':'CREATE','schema_status':'MISSING'})
-    monkeypatch.setattr(deployment,'_safe_execute_artifact',lambda content:(_ for _ in ()).throw(RuntimeError('simulated dbx failure')))
+    monkeypatch.setattr(deployment,'_safe_execute_artifact',lambda content,**kwargs:(_ for _ in ()).throw(RuntimeError('simulated dbx failure')))
     r=deployment.deploy_dev(db,p.id)
     assert r['status']=='FAILED' and r['run_id']
     failed=deployment.latest_failed_dev_run(db,p.id)
     assert failed and failed.id==r['run_id'] and failed.checkpoint=='sales.Orders'
+
+
+def test_destructive_artifact_requires_explicit_approval(monkeypatch):
+    executed=[]
+    monkeypatch.setattr(deployment,'execute_sql',lambda sql,**kwargs:executed.append(sql))
+
+    try:
+        deployment._safe_execute_artifact('DELETE FROM target_table')
+        assert False, 'destructive SQL must be blocked without approval'
+    except RuntimeError as exc:
+        assert 'explicit governed replacement' in str(exc)
+    assert executed == []
+
+    deployment._safe_execute_artifact('DELETE FROM target_table', allow_destructive=True)
+    assert executed == ['DELETE FROM target_table']
