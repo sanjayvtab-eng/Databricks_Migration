@@ -709,11 +709,14 @@ export default function App() {
       )
     )
       return;
+    const allowDestructive = confirm(
+      "Existing DEV Bronze data may need replacement. Approve destructive DEV replacement for this run only? Select Cancel to keep replacement blocked.",
+    );
     await action(async () => {
       const result: any = await api(`/projects/${pid}/medallion/deploy-dev`, {
         method: "POST",
         body: JSON.stringify({
-          allow_destructive: false,
+          allow_destructive: allowDestructive,
           batch_size: deployBatch,
           max_rows: deployMaxRows ? Number(deployMaxRows) : null,
         }),
