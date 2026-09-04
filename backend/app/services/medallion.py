@@ -1360,7 +1360,11 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
     """
     from app.models.canonical import MigrationDeployment
     from app.services.databricks_client import execute_sql
-    from app.services.deployment import _apply_table_schema_policy, load_bronze_table
+    from app.services.deployment import (
+        _apply_table_schema_policy,
+        databricks_workspace_identity,
+        load_bronze_table,
+    )
 
     env = "DEV"
     artifacts = list_medallion_artifacts(db, project_id, environment=env)
@@ -1401,7 +1405,9 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
                 detail = {"action": "EXECUTE_ARTIFACT"}
             db.add(MigrationDeployment(id=uid("DPL"), project_id=project_id, object_id=node.source_object_id,
                                        environment="DEV", status="PASSED",
-                                       payload_json=_json({"run_id": run_id, "medallion_node_id": node.id,
+                                       payload_json=_json({"run_id": run_id,
+                                                           "databricks_workspace": databricks_workspace_identity(),
+                                                           "medallion_node_id": node.id,
                                                            "layer": node.layer, "target_fqn": node.target_fqn,
                                                            "artifact_version_id": item["artifact_version_id"], **detail})))
             node.status = "DEPLOYED"; deployed.append({"target_fqn": node.target_fqn, "layer": node.layer, "status": "PASSED"})
@@ -1409,14 +1415,18 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
         except Exception as exc:
             db.add(MigrationDeployment(id=uid("DPL"), project_id=project_id, object_id=node.source_object_id,
                                        environment="DEV", status="FAILED",
-                                       payload_json=_json({"run_id": run_id, "medallion_node_id": node.id,
+                                       payload_json=_json({"run_id": run_id,
+                                                           "databricks_workspace": databricks_workspace_identity(),
+                                                           "medallion_node_id": node.id,
                                                            "layer": node.layer, "target_fqn": node.target_fqn,
                                                            "artifact_version_id": item["artifact_version_id"], "error": str(exc)})))
             node.status = "FAILED"; db.commit()
             return {"run_id": run_id, "status": "FAILED", "failed_target": node.target_fqn, "error": str(exc), "deployed": deployed}
     db.add(MigrationDeployment(
         id=uid("DPL"), project_id=project_id, object_id=None, environment="DEV", status="PASSED",
-        payload_json=_json({"run_id": run_id, "medallion_run_complete": True,
+        payload_json=_json({"run_id": run_id,
+                            "databricks_workspace": databricks_workspace_identity(),
+                            "medallion_run_complete": True,
                             "deployed": len(deployed), "expected": len(artifacts)}),
     ))
     db.commit()

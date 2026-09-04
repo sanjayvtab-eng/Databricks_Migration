@@ -1,7 +1,8 @@
 from sqlalchemy import select
 from app.services.engine import ensure_project, add_source, ingest_snapshot, classify_project, create_mappings, generate_artifact, uid
 from app.services import deployment
-from app.models.entities import MigrationArtifactVersion, MigrationReview, MigrationRun, MigrationQualityGate
+from app.models.entities import MigrationArtifactVersion, MigrationIssue, MigrationReview, MigrationRun, MigrationQualityGate
+from app.models.canonical import MigrationDeployment
 
 
 def seed_approved(db, name='Deploy P'):
@@ -66,3 +67,52 @@ def test_destructive_artifact_requires_explicit_approval(monkeypatch):
 
     deployment._safe_execute_artifact('DELETE FROM target_table', allow_destructive=True)
     assert executed == ['DELETE FROM target_table']
+
+
+def test_target_ownership_is_scoped_to_databricks_workspace(db, monkeypatch):
+    current, obj, _ = seed_approved(db, 'Current workspace project')
+    other = ensure_project(db, 'Other workspace project')
+    mapping = deployment._mapping(db, current.id, obj.id, 'DEV')
+    monkeypatch.setattr(deployment, 'databricks_workspace_identity', lambda: 'new-workspace.cloud.databricks.com')
+
+    # A legacy row has no reliable workspace identity and remains audit-only.
+    db.add(MigrationDeployment(id=uid('DPL'), project_id=other.id, object_id=None,
+                               environment='DEV', status='PASSED',
+                               payload_json=deployment._json({'target_fqn': mapping.target_fqn})))
+    # An identical target name in a different physical workspace is not a collision.
+    db.add(MigrationDeployment(id=uid('DPL'), project_id=other.id, object_id=None,
+                               environment='DEV', status='PASSED',
+                               payload_json=deployment._json({
+                                   'target_fqn': mapping.target_fqn,
+                                   'databricks_workspace': 'old-workspace.cloud.databricks.com',
+                               })))
+    db.commit()
+    assert deployment._target_owner_collision(db, current.id, mapping.target_fqn) is None
+
+    same_workspace = MigrationDeployment(id=uid('DPL'), project_id=other.id, object_id=None,
+                                         environment='DEV', status='PASSED',
+                                         payload_json=deployment._json({
+                                             'target_fqn': mapping.target_fqn,
+                                             'databricks_workspace': 'new-workspace.cloud.databricks.com',
+                                         }))
+    db.add(same_workspace); db.commit()
+    assert deployment._target_owner_collision(db, current.id, mapping.target_fqn).id == same_workspace.id
+
+
+def test_precheck_resolves_legacy_ownership_blocker(db, monkeypatch):
+    current, obj, _ = seed_approved(db, 'Legacy ownership issue')
+    monkeypatch.setattr(deployment, 'databricks_workspace_identity', lambda: 'new-workspace.cloud.databricks.com')
+    issue = MigrationIssue(
+        id=uid('ISS'), project_id=current.id, object_id=obj.id,
+        issue_type='DEPLOYMENT', severity='BLOCKER', status='OPEN',
+        message='DEV deployment failed at sales.Orders',
+        technical_details=deployment._json({
+            'error': 'Target ownership collision: `cat_dev`.`bronze`.`Orders` is already owned by project old',
+        }),
+    )
+    db.add(issue); db.commit()
+
+    deployment._resolve_stale_ownership_issues(db, current.id)
+
+    db.refresh(issue)
+    assert issue.status == 'RESOLVED'

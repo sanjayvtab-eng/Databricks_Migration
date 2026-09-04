@@ -66,6 +66,64 @@ def _payload(row) -> dict[str, Any]:
         return {}
 
 
+def databricks_workspace_identity() -> str:
+    """Return the non-secret identity used to scope target ownership."""
+    host = (get_settings().databricks_host or "").strip().lower()
+    host = re.sub(r"^https?://", "", host).rstrip("/")
+    return host
+
+
+def _normalized_target_fqn(value: str | None) -> str:
+    return (value or "").replace("`", "").strip().lower()
+
+
+def _target_owner_collision(db: Session, project_id: str, target_fqn: str) -> MigrationDeployment | None:
+    """Find an owner of this physical target in the current Databricks workspace.
+
+    Older deployment rows did not record a workspace identity. They cannot safely
+    represent ownership after the configured Databricks account changes, so they
+    remain audit history but are not used as cross-project ownership locks.
+    """
+    workspace = databricks_workspace_identity()
+    if not workspace:
+        return None
+    target = _normalized_target_fqn(target_fqn)
+    rows = db.scalars(select(MigrationDeployment).where(
+        MigrationDeployment.project_id != project_id,
+        MigrationDeployment.status == "PASSED",
+    )).all()
+    for row in rows:
+        payload = _payload(row)
+        owner_workspace = str(payload.get("databricks_workspace") or "").strip().lower()
+        if owner_workspace == workspace and _normalized_target_fqn(payload.get("target_fqn")) == target:
+            return row
+    return None
+
+
+def _resolve_stale_ownership_issues(db: Session, project_id: str) -> None:
+    """Resolve ownership failures that came from legacy, unscoped deployment rows."""
+    changed = False
+    issues = db.scalars(select(MigrationIssue).where(
+        MigrationIssue.project_id == project_id,
+        MigrationIssue.issue_type == "DEPLOYMENT",
+        MigrationIssue.status == "OPEN",
+    )).all()
+    for issue in issues:
+        try:
+            details = json.loads(issue.technical_details or "{}")
+        except Exception:
+            details = {}
+        error = str(details.get("error") or "")
+        if "Target ownership collision:" not in error:
+            continue
+        mapping = _mapping(db, project_id, issue.object_id, "DEV") if issue.object_id else None
+        if mapping and _target_owner_collision(db, project_id, mapping.target_fqn) is None:
+            issue.status = "RESOLVED"
+            changed = True
+    if changed:
+        db.commit()
+
+
 def _record_step(db: Session, project_id: str, run_id: str, name: str, status: str,
                  object_id: str | None = None, environment: str = "DEV", **details) -> MigrationRunStep:
     row = MigrationRunStep(
@@ -83,7 +141,7 @@ def _deployment_evidence(db: Session, project_id: str, run_id: str, status: str,
     row = MigrationDeployment(
         id=uid("DPL"), project_id=project_id, object_id=object_id,
         environment=environment, status=status,
-        payload_json=_json({"run_id": run_id, **details}),
+        payload_json=_json({"run_id": run_id, "databricks_workspace": databricks_workspace_identity(), **details}),
     )
     db.add(row)
     db.commit()
@@ -243,6 +301,7 @@ def dev_precheck(db: Session, project_id: str, test_databricks: bool = True, ign
                         f"{item['strategy']} ({item['notes']})"
                     )
 
+    _resolve_stale_ownership_issues(db, project_id)
     open_blockers = db.scalars(select(MigrationIssue).where(
         MigrationIssue.project_id == project_id,
         MigrationIssue.status == "OPEN",
@@ -441,11 +500,14 @@ def deploy_dev(db: Session, project_id: str, *, allow_destructive: bool = False,
             mapping = _mapping(db, project_id, object_id, "DEV")
             if not mapping:
                 raise RuntimeError(f"DEV mapping missing for {obj.schema_name}.{obj.object_name}")
-            # Prevent one project from replacing a target previously owned by another project.
-            other_rows = db.scalars(select(MigrationDeployment).where(MigrationDeployment.project_id != project_id)).all()
-            for own in other_rows:
-                if _payload(own).get("target_fqn") == mapping.target_fqn and own.status == "PASSED":
-                    raise RuntimeError(f"Target ownership collision: {mapping.target_fqn} is already owned by project {own.project_id}")
+            # Prevent replacement only when another project owns this target in the
+            # same Databricks workspace. Identical FQNs in separate accounts are safe.
+            owner = _target_owner_collision(db, project_id, mapping.target_fqn)
+            if owner:
+                raise RuntimeError(
+                    f"Target ownership collision: {mapping.target_fqn} is already owned "
+                    f"by project {owner.project_id} in workspace {databricks_workspace_identity()}"
+                )
             catalog, schema, _ = _parse_target_fqn(mapping.target_fqn)
             failure_stage = "TARGET_SCHEMA"
             execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
