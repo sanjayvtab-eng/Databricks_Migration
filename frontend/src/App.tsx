@@ -151,7 +151,6 @@ const moduleMap: any = {
   Assessment: "assessment",
   "Conversion Plans": "conversion-plans",
   "Data Quality": "data-quality",
-  Reconciliation: "reconciliation",
   Deployments: "deployments",
   Waves: "waves",
   Cutover: "cutover",
@@ -355,6 +354,10 @@ export default function App() {
         setAiPlan(plan);
         setAiProvider(provider);
       }
+      if (page === "Reconciliation" && id)
+        setReconResult(
+          await api(`/projects/${id}/deployments/dev/reconciliation/latest`),
+        );
       if (page === "Deployments" && id)
         setDeployment(await api(`/projects/${id}/deployments/dev/status`));
       if (page === "Users") setUsers(await api("/users"));
@@ -405,6 +408,33 @@ export default function App() {
         "migration_dev_logs.csv",
       );
       setMsg("Log downloaded successfully");
+    } catch (e: any) {
+      setMsg(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function runDevReconciliation() {
+    if (!pid) return;
+    await action(async () => {
+      const result: any = await api(
+        `/projects/${pid}/deployments/dev/reconcile`,
+        { method: "POST" },
+      );
+      setReconResult(result);
+      return result;
+    });
+  }
+  async function downloadReconciliation() {
+    if (!pid || !reconResult?.run_id) return;
+    setBusy(true);
+    setMsg("");
+    try {
+      await downloadApi(
+        `/projects/${pid}/deployments/dev/reconciliation/latest/download`,
+        `medallion_reconciliation_${reconResult.run_id}.csv`,
+      );
+      setMsg("Reconciliation log downloaded");
     } catch (e: any) {
       setMsg(e.message);
     } finally {
@@ -3620,6 +3650,105 @@ export default function App() {
                 )}
               </Panel>
             </>
+          )}
+          {page === "Reconciliation" && (
+            <Panel
+              title="DEV Medallion reconciliation"
+              actions={
+                <div className="deploy-actions">
+                  <button
+                    className="primary-action"
+                    disabled={!pid || busy}
+                    onClick={runDevReconciliation}
+                  >
+                    <Gauge size={15} />
+                    Run DEV Reconciliation
+                  </button>
+                  <button
+                    disabled={!pid || busy || !reconResult?.run_id}
+                    onClick={downloadReconciliation}
+                  >
+                    <Download size={15} />
+                    Download CSV
+                  </button>
+                </div>
+              }
+            >
+              <div className="notice ok">
+                Reconciliation uses the exact artifact versions from the latest
+                successful Medallion MDR run. Tables and views use count checks;
+                functions and procedures use safe metadata checks and are never
+                executed.
+              </div>
+              <div className="deployment-summary">
+                <div className="summary-stat">
+                  <span>Status</span>
+                  <Badge s={reconResult?.status || "NOT_STARTED"} />
+                </div>
+                <div className="summary-stat">
+                  <span>Workflow</span>
+                  <b>{reconResult?.workflow || "MEDALLION"}</b>
+                </div>
+                <div className="summary-stat">
+                  <span>Deployment run</span>
+                  <b>{reconResult?.run_id || "-"}</b>
+                </div>
+                <div className="summary-stat">
+                  <span>Objects checked</span>
+                  <b>{reconResult?.details_count || 0}</b>
+                </div>
+                <div className="summary-stat">
+                  <span>Passed</span>
+                  <b>{reconResult?.passed || 0}</b>
+                </div>
+                <div className="summary-stat">
+                  <span>Failed</span>
+                  <b>{reconResult?.failed || 0}</b>
+                </div>
+              </div>
+              {reconResult?.details?.length ? (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Layer</th>
+                      <th>Object</th>
+                      <th>Type</th>
+                      <th>Check</th>
+                      <th>Source</th>
+                      <th>Target</th>
+                      <th>Version</th>
+                      <th>Status</th>
+                      <th>Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reconResult.details.map((x: any) => (
+                      <tr
+                        key={`${x.medallion_node_id}-${x.artifact_version_id}`}
+                      >
+                        <td>
+                          <Badge s={x.layer} />
+                        </td>
+                        <td>
+                          <code>{x.target_fqn || x.object}</code>
+                        </td>
+                        <td>{x.object_type || "-"}</td>
+                        <td>{x.reconciliation_type}</td>
+                        <td>{x.source_count ?? "-"}</td>
+                        <td>{x.target_count ?? "-"}</td>
+                        <td>{x.artifact_version ? `v${x.artifact_version}` : "-"}</td>
+                        <td>
+                          <Badge s={x.status} />
+                        </td>
+                        <td>{x.error || "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <Empty text="No Medallion reconciliation has been run yet. Deploy Medallion DEV successfully, then run reconciliation." />
+              )}
+            </Panel>
           )}
           {page === "Lifecycle" && (
             <Panel title="Project-specific lifecycle">

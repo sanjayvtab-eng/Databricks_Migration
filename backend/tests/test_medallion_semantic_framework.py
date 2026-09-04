@@ -166,3 +166,62 @@ def test_medallion_dev_deployment_is_review_gated_and_layer_ordered(client,auth_
     assert download.status_code==200
     assert 'text/csv' in download.headers['content-type']
     assert 'target_fqn' in download.text
+
+
+def test_reconciliation_uses_exact_medallion_manifest_and_type_aware_checks(client,auth_headers,db,monkeypatch):
+    from app.services.medallion import deploy_medallion_dev
+    from app.services.deployment import run_reconciliation, latest_reconciliation, evaluate_dev_gate
+    from app.models.entities import MigrationStageArtifactVersion
+    from app.models.canonical import MigrationDeployment
+    import app.services.databricks_client as dc
+    import app.services.deployment as dep
+    import json
+
+    pid=_project_with_semantics(client,auth_headers)
+    client.post(f'/api/projects/{pid}/semantics/infer',headers=auth_headers)
+    semantics=client.get(f'/api/projects/{pid}/semantics',headers=auth_headers).json()
+    for semantic in semantics:
+        if semantic['status']!='APPROVED' and semantic['semantic_role'] in {'FACT','DIMENSION','AGGREGATE'}:
+            client.post(f"/api/projects/{pid}/semantics/{semantic['id']}/approve",headers=auth_headers,json={'actor':'architect'})
+    client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'})
+    client.post(f'/api/projects/{pid}/medallion/generate?environment=DEV',headers=auth_headers)
+    for row in db.query(MigrationStageArtifactVersion).filter_by(project_id=pid).all():
+        if row.executable and row.validation_status=='PASSED':
+            row.review_status='APPROVED'; row.reviewer='architect'
+    db.commit()
+
+    monkeypatch.setattr(dc,'execute_sql',lambda sql,safe_retry=False: [])
+    monkeypatch.setattr(dep,'_apply_table_schema_policy',lambda *a,**k:{'action':'CREATE','schema_status':'MISSING'})
+    monkeypatch.setattr(dep,'load_bronze_table',lambda *a,**k:{'status':'PASSED','rows':10})
+    deployed=deploy_medallion_dev(db,pid)
+    assert deployed['status']=='PASSED'
+
+    # Simulate duplicate immutable evidence from a retry. Reconciliation must still emit
+    # one row per Medallion node and must not re-introduce historical artifact duplicates.
+    first=db.query(MigrationDeployment).filter_by(project_id=pid).first()
+    db.add(MigrationDeployment(id='DPL_duplicate',project_id=pid,object_id=first.object_id,
+        environment='DEV',status='PASSED',payload_json=first.payload_json));db.commit()
+
+    statements=[]
+    def fake_execute(sql,safe_retry=True):
+        statements.append(sql)
+        return [[10]] if sql.startswith('SELECT COUNT(*)') else [['exists']]
+    monkeypatch.setattr(dep,'execute_sql',fake_execute)
+
+    monkeypatch.setattr(dep,'_source_table_count',lambda *a,**k:10)
+
+    result=run_reconciliation(db,pid,'DEV')
+    assert result['workflow']=='MEDALLION'
+    assert result['run_id']==deployed['run_id']
+    assert result['status']=='PASSED' and result['failed']==0
+    assert len(result['details'])==len(deployed['deployed'])
+    assert len({x['medallion_node_id'] for x in result['details']})==len(result['details'])
+    assert any(x['layer']=='GOLD' for x in result['details'])
+    assert any(x['reconciliation_type']=='FUNCTION_EXISTENCE' for x in result['details'])
+    assert any(x['reconciliation_type']=='PROCEDURE_EXISTENCE' for x in result['details'])
+    assert any(sql.startswith('DESCRIBE FUNCTION') for sql in statements)
+    assert any(sql.startswith('DESCRIBE PROCEDURE') for sql in statements)
+    latest=latest_reconciliation(db,pid,'DEV')
+    assert latest and latest['run_id']==deployed['run_id'] and len(latest['details'])==len(result['details'])
+    gate=evaluate_dev_gate(db,pid)
+    assert gate['status']=='PASSED' and gate['deployment_run_id']==deployed['run_id']

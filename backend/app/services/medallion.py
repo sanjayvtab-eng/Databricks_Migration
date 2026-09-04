@@ -1414,4 +1414,10 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
                                                            "artifact_version_id": item["artifact_version_id"], "error": str(exc)})))
             node.status = "FAILED"; db.commit()
             return {"run_id": run_id, "status": "FAILED", "failed_target": node.target_fqn, "error": str(exc), "deployed": deployed}
+    db.add(MigrationDeployment(
+        id=uid("DPL"), project_id=project_id, object_id=None, environment="DEV", status="PASSED",
+        payload_json=_json({"run_id": run_id, "medallion_run_complete": True,
+                            "deployed": len(deployed), "expected": len(artifacts)}),
+    ))
+    db.commit()
     return {"run_id": run_id, "status": "PASSED", "deployed": deployed, "count": len(deployed)}

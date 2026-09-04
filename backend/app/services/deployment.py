@@ -23,6 +23,8 @@ from app.models.entities import (
     MigrationReview,
     MigrationRun,
     MigrationSource,
+    MigrationMedallionNode,
+    MigrationStageArtifactVersion,
 )
 from app.models.canonical import (
     MigrationDeployment,
@@ -532,8 +534,165 @@ def latest_failed_dev_run(db: Session, project_id: str) -> MigrationRun | None:
     ).order_by(MigrationRun.started_at.desc())).first()
 
 
+def _latest_successful_medallion_run(
+    db: Session, project_id: str, environment: str
+) -> tuple[str, list[tuple[MigrationDeployment, dict[str, Any]]]] | None:
+    """Return the latest complete Medallion run from immutable deployment evidence.
+
+    Medallion deployments pre-date MigrationRun integration, so the deployed version IDs
+    recorded on MigrationDeployment are the authoritative manifest. Grouping by MDR run ID
+    also prevents historical/current source artifact duplicates from entering reconciliation.
+    """
+    rows = list(db.scalars(select(MigrationDeployment).where(
+        MigrationDeployment.project_id == project_id,
+        MigrationDeployment.environment == environment,
+    ).order_by(MigrationDeployment.created_at.desc())).all())
+    grouped: dict[str, list[tuple[MigrationDeployment, dict[str, Any]]]] = {}
+    newest: dict[str, datetime] = {}
+    completed: set[str] = set()
+    for row in rows:
+        payload = _payload(row)
+        run_id = str(payload.get("run_id") or "")
+        if not run_id.startswith("MDR_"):
+            continue
+        if payload.get("medallion_run_complete") and row.status == "PASSED":
+            completed.add(run_id)
+            newest[run_id] = max(newest.get(run_id, row.created_at), row.created_at)
+            continue
+        if not payload.get("medallion_node_id"):
+            continue
+        grouped.setdefault(run_id, []).append((row, payload))
+        newest[run_id] = max(newest.get(run_id, row.created_at), row.created_at)
+    expected_nodes = {node.id for node in db.scalars(select(MigrationMedallionNode).where(
+        MigrationMedallionNode.project_id == project_id,
+        MigrationMedallionNode.environment == environment,
+        MigrationMedallionNode.layer.in_(["BRONZE", "SILVER", "GOLD"]),
+    )).all()}
+    for run_id in sorted(grouped, key=lambda rid: newest[rid], reverse=True):
+        run_rows = grouped[run_id]
+        if run_rows and all(row.status == "PASSED" for row, _ in run_rows):
+            # One deployed artifact per node is the exact immutable manifest for this run.
+            chosen: dict[str, tuple[MigrationDeployment, dict[str, Any]]] = {}
+            for row, payload in run_rows:
+                node_id = str(payload["medallion_node_id"])
+                prior = chosen.get(node_id)
+                if prior is None or row.created_at > prior[0].created_at:
+                    chosen[node_id] = (row, payload)
+            # New builds record an explicit completion marker. Older builds are accepted only
+            # when their evidence covers the entire current Medallion plan.
+            if run_id in completed or (expected_nodes and set(chosen) == expected_nodes):
+                return run_id, list(chosen.values())
+    return None
+
+
+def _routine_exists(target_fqn: str, routine_type: str) -> None:
+    """Validate routine metadata without invoking business logic or causing side effects."""
+    statement = (
+        f"DESCRIBE FUNCTION EXTENDED {target_fqn}"
+        if routine_type == "FUNCTION"
+        else f"DESCRIBE PROCEDURE {target_fqn}"
+    )
+    execute_sql(statement, safe_retry=True)
+
+
+def _source_table_count(source: MigrationSource, obj: MigrationObject) -> int:
+    import pyodbc
+    with pyodbc.connect(_source_connection_string(source), timeout=30) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM [{obj.schema_name.replace(']', ']]')}]."
+            f"[{obj.object_name.replace(']', ']]')}]"
+        )
+        return int(cur.fetchone()[0])
+
+
+def _reconcile_medallion_run(
+    db: Session,
+    project_id: str,
+    environment: str,
+    run_id: str,
+    manifest: list[tuple[MigrationDeployment, dict[str, Any]]],
+) -> dict[str, Any]:
+    details: list[dict[str, Any]] = []
+    passed = failed = 0
+    for evidence, deployed in sorted(
+        manifest,
+        key=lambda item: ({"BRONZE": 1, "SILVER": 2, "GOLD": 3}.get(str(item[1].get("layer")), 9),
+                          str(item[1].get("target_fqn") or "").lower()),
+    ):
+        node = db.get(MigrationMedallionNode, deployed.get("medallion_node_id"))
+        version = db.get(MigrationStageArtifactVersion, deployed.get("artifact_version_id"))
+        obj = db.get(MigrationObject, node.source_object_id) if node and node.source_object_id else None
+        target_fqn = str(deployed.get("target_fqn") or (node.target_fqn if node else ""))
+        node_type = str(node.node_type if node else "UNKNOWN").upper()
+        source_type = str(obj.object_type if obj else "").upper()
+        status = "PASSED"
+        source_count = target_count = None
+        error = None
+        check_type = "TARGET_EXISTENCE_COUNT"
+        try:
+            if node_type in {"SQL_FUNCTION", "FUNCTION_PLAN"} or source_type == "FUNCTION":
+                check_type = "FUNCTION_EXISTENCE"
+                _routine_exists(target_fqn, "FUNCTION")
+            elif node_type in {"SQL_PROCEDURE", "ROUTINE_PLAN"} or source_type == "PROCEDURE":
+                check_type = "PROCEDURE_EXISTENCE"
+                _routine_exists(target_fqn, "PROCEDURE")
+            else:
+                target_rows = execute_sql(f"SELECT COUNT(*) FROM {target_fqn}", safe_retry=True)
+                target_count = int(target_rows[0][0]) if target_rows else 0
+                if node and node.layer == "BRONZE" and obj and source_type == "TABLE":
+                    check_type = "ROW_COUNT"
+                    src = db.get(MigrationSource, obj.source_id)
+                    if not src:
+                        raise RuntimeError("Source profile missing")
+                    source_count = _source_table_count(src, obj)
+                    if source_count != target_count:
+                        status = "FAILED"
+        except Exception as exc:
+            status = "FAILED"
+            error = str(exc)
+        passed += status == "PASSED"
+        failed += status == "FAILED"
+        item = {
+            "object_id": obj.id if obj else evidence.object_id,
+            "medallion_node_id": node.id if node else deployed.get("medallion_node_id"),
+            "artifact_version_id": version.id if version else deployed.get("artifact_version_id"),
+            "artifact_version": version.version if version else None,
+            "object": f"{obj.schema_name}.{obj.object_name}" if obj else (node.target_name if node else target_fqn),
+            "target_fqn": target_fqn,
+            "layer": deployed.get("layer") or (node.layer if node else None),
+            "object_type": node_type,
+            "reconciliation_type": check_type,
+            "source_count": source_count,
+            "target_count": target_count,
+            "status": status,
+            "error": error,
+        }
+        details.append(item)
+        db.add(MigrationReconciliationDetail(
+            id=uid("RCD"), project_id=project_id, object_id=item["object_id"],
+            environment=environment, status=status, payload_json=_json({"run_id": run_id, **item}),
+        ))
+    overall = "PASSED" if failed == 0 and details else "FAILED"
+    summary = {
+        "run_id": run_id, "workflow": "MEDALLION", "passed": passed,
+        "failed": failed, "details_count": len(details),
+    }
+    db.add(MigrationReconciliation(
+        id=uid("REC"), project_id=project_id, environment=environment,
+        status=overall, payload_json=_json(summary),
+    ))
+    db.commit()
+    return {**summary, "status": overall, "details": details}
+
+
 def run_reconciliation(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any]:
     env = environment.upper()
+    medallion = _latest_successful_medallion_run(db, project_id, env)
+    if medallion:
+        return _reconcile_medallion_run(db, project_id, env, medallion[0], medallion[1])
+
+    # Backward-compatible fallback for projects that only use the legacy artifact workflow.
     run = db.scalars(select(MigrationRun).where(
         MigrationRun.project_id == project_id,
         MigrationRun.environment == env,
@@ -581,25 +740,62 @@ def run_reconciliation(db: Session, project_id: str, environment: str = "DEV") -
     return {"run_id": run.id, "status": overall, "passed": passed, "failed": failed, "details": details}
 
 
+def latest_reconciliation(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any] | None:
+    env = environment.upper()
+    row = db.scalars(select(MigrationReconciliation).where(
+        MigrationReconciliation.project_id == project_id,
+        MigrationReconciliation.environment == env,
+    ).order_by(MigrationReconciliation.created_at.desc())).first()
+    if not row:
+        return None
+    summary = _payload(row)
+    run_id = summary.get("run_id")
+    detail_rows = list(db.scalars(select(MigrationReconciliationDetail).where(
+        MigrationReconciliationDetail.project_id == project_id,
+        MigrationReconciliationDetail.environment == env,
+    ).order_by(MigrationReconciliationDetail.created_at.asc())).all())
+    details = [_payload(item) for item in detail_rows if _payload(item).get("run_id") == run_id]
+    return {**summary, "status": row.status, "reconciliation_id": row.id,
+            "created_at": row.created_at, "details": details}
+
+
 def evaluate_dev_gate(db: Session, project_id: str) -> dict[str, Any]:
     blockers: list[str] = []
+    medallion = _latest_successful_medallion_run(db, project_id, "DEV")
     deployment = db.scalars(select(MigrationRun).where(
         MigrationRun.project_id == project_id, MigrationRun.environment == "DEV",
         MigrationRun.stage == "DEV_DEPLOYMENT",
     ).order_by(MigrationRun.started_at.desc())).first()
-    if not deployment or deployment.status != "PASSED":
+    deployment_run_id = medallion[0] if medallion else (deployment.id if deployment else None)
+    if not medallion and (not deployment or deployment.status != "PASSED"):
         blockers.append("Latest DEV deployment is not PASSED")
 
-    versions = _latest_current_versions(db, project_id)
-    for _, av, obj in versions:
-        if not _approved(db, project_id, av.id):
-            blockers.append(f"{obj.schema_name}.{obj.object_name} current artifact version is not approved")
+    if medallion:
+        for _, payload in medallion[1]:
+            version = db.get(MigrationStageArtifactVersion, payload.get("artifact_version_id"))
+            if not version or version.review_status != "APPROVED" or version.validation_status != "PASSED":
+                blockers.append(f"{payload.get('target_fqn')} deployed Medallion version is no longer approved/validated")
+    else:
+        versions = _latest_current_versions(db, project_id)
+        for _, av, obj in versions:
+            if not _approved(db, project_id, av.id):
+                blockers.append(f"{obj.schema_name}.{obj.object_name} current artifact version is not approved")
 
     open_issues = db.scalars(select(MigrationIssue).where(
         MigrationIssue.project_id == project_id, MigrationIssue.status == "OPEN", MigrationIssue.severity == "BLOCKER"
     )).all()
-    if open_issues:
-        blockers.append(f"{len(open_issues)} open blocker issue(s)")
+    relevant_issues = []
+    for issue in open_issues:
+        if medallion and issue.issue_type == "DEPLOYMENT":
+            try:
+                issue_run_id = json.loads(issue.technical_details or "{}").get("run_id")
+            except Exception:
+                issue_run_id = None
+            if issue_run_id and issue_run_id != deployment_run_id:
+                continue
+        relevant_issues.append(issue)
+    if relevant_issues:
+        blockers.append(f"{len(relevant_issues)} open blocker issue(s)")
 
     recon = db.scalars(select(MigrationReconciliation).where(
         MigrationReconciliation.project_id == project_id, MigrationReconciliation.environment == "DEV"
@@ -614,10 +810,10 @@ def evaluate_dev_gate(db: Session, project_id: str) -> dict[str, Any]:
     gate = MigrationQualityGate(id=uid("GAT"), project_id=project_id, run_id=run.id, environment="DEV", status=status,
                                 pass_count=3 if status == "PASSED" else max(0, 3-len(blockers)),
                                 fail_count=len(blockers), blocker_count=len(blockers),
-                                deployment_version=deployment.id if deployment else None)
+                                deployment_version=deployment_run_id)
     db.add(gate); db.commit()
     return {"gate_id": gate.id, "run_id": run.id, "status": status, "blockers": blockers,
-            "deployment_run_id": deployment.id if deployment else None}
+            "deployment_run_id": deployment_run_id}
 
 
 def deployment_status(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any]:

@@ -13,7 +13,10 @@ from app.services.discovery import discover_sqlserver, test_sqlserver_connection
 from app.core.config import get_settings
 from app.services.databricks_client import execute_sql
 from app.services.type_compatibility import compatibility_catalog, transport_contract, transport_summary
-from app.services.deployment import dev_precheck, deploy_dev, latest_failed_dev_run, run_reconciliation, evaluate_dev_gate, deployment_status
+from app.services.deployment import (
+    dev_precheck, deploy_dev, latest_failed_dev_run, run_reconciliation,
+    latest_reconciliation, evaluate_dev_gate, deployment_status,
+)
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
     upsert_explicit_semantic, approve_semantic, build_medallion_plan, medallion_plan,
@@ -700,6 +703,33 @@ def deployment_resume(project_id:str,data:DeployDevIn,db:Session=Depends(get_db)
 def deployment_reconcile(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     try: return run_reconciliation(db,project_id,"DEV")
     except ValueError as e: raise HTTPException(400,str(e))
+
+@router.get("/projects/{project_id}/deployments/dev/reconciliation/latest")
+def deployment_reconciliation_latest(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    return latest_reconciliation(db,project_id,"DEV") or {
+        "status":"NOT_STARTED","workflow":"MEDALLION","run_id":None,
+        "passed":0,"failed":0,"details_count":0,"details":[],
+    }
+
+@router.get("/projects/{project_id}/deployments/dev/reconciliation/latest/download")
+def deployment_reconciliation_download(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    result=latest_reconciliation(db,project_id,"DEV")
+    if not result: raise HTTPException(404,"No DEV reconciliation result exists")
+    out=io.StringIO(); writer=csv.writer(out)
+    writer.writerow(["run_id","layer","object","object_type","target_fqn","check","source_count","target_count","status","artifact_version","artifact_version_id","error"])
+    for row in result.get("details",[]):
+        writer.writerow([
+            result.get("run_id"),row.get("layer"),row.get("object"),row.get("object_type"),
+            row.get("target_fqn"),row.get("reconciliation_type"),row.get("source_count"),
+            row.get("target_count"),row.get("status"),row.get("artifact_version"),
+            row.get("artifact_version_id"),row.get("error"),
+        ])
+    return Response(
+        content=out.getvalue(),media_type="text/csv",
+        headers={"Content-Disposition":f'attachment; filename="medallion_reconciliation_{result.get("run_id")}.csv"'},
+    )
 
 @router.post("/projects/{project_id}/deployments/dev/evaluate-gate")
 def deployment_gate(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
