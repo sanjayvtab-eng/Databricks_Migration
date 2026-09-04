@@ -16,6 +16,7 @@ from app.services.type_compatibility import compatibility_catalog, transport_con
 from app.services.deployment import (
     dev_precheck, deploy_dev, latest_failed_dev_run, run_reconciliation,
     latest_reconciliation, evaluate_dev_gate, deployment_status,
+    test_promotion_precheck, promote_medallion_to_test, evaluate_test_gate,
 )
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
@@ -99,7 +100,8 @@ def _decode_payload_json(value: str | None) -> dict:
     except Exception: return {}
 
 
-def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
+def _environment_log_rows(db: Session, project_id: str, environment: str) -> list[dict]:
+    env=environment.upper()
     rows=[]
     sources=[
         ("DEPLOYMENT", MigrationDeployment),
@@ -111,7 +113,7 @@ def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
     for category, model in sources:
         q=select(model).where(model.project_id==project_id)
         if hasattr(model,"environment"):
-            q=q.where((model.environment=="DEV") | (model.environment==None))  # noqa: E711
+            q=q.where((model.environment==env) | (model.environment==None))  # noqa: E711
         for row in db.scalars(q).all():
             payload=_decode_payload_json(getattr(row,"payload_json",None))
             rows.append({
@@ -128,6 +130,10 @@ def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
             })
     rows.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
     return rows
+
+
+def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
+    return _environment_log_rows(db,project_id,"DEV")
 
 
 def _sqlserver_conn_for_source(src: MigrationSource) -> str:
@@ -738,6 +744,53 @@ def deployment_gate(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
 @router.get("/projects/{project_id}/deployments/dev/status")
 def deployment_status_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     return deployment_status(db,project_id,"DEV")
+
+
+@router.post("/projects/{project_id}/promotions/test/precheck")
+def test_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return test_promotion_precheck(db,project_id,test_databricks=True)
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.post("/projects/{project_id}/promotions/test/deploy")
+def test_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try:
+        result=promote_medallion_to_test(db,project_id)
+        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        return result
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/test/status")
+def test_promotion_status_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return deployment_status(db,project_id,"TEST")
+
+
+@router.post("/projects/{project_id}/promotions/test/reconcile")
+def test_promotion_reconcile_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return run_reconciliation(db,project_id,"TEST")
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/test/reconciliation/latest")
+def test_reconciliation_latest_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    return latest_reconciliation(db,project_id,"TEST") or {
+        "status":"NOT_STARTED","workflow":"MEDALLION","run_id":None,
+        "passed":0,"failed":0,"details_count":0,"details":[],
+    }
+
+
+@router.post("/projects/{project_id}/promotions/test/evaluate-gate")
+def test_gate_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return evaluate_test_gate(db,project_id)
+
+
+@router.get("/projects/{project_id}/promotions/test/logs")
+def test_promotion_logs_api(project_id:str,limit:int=1000,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    rows=_environment_log_rows(db,project_id,"TEST")[:max(1,min(limit,5000))]
+    return {"project_id":project_id,"environment":"TEST","count":len(rows),"logs":rows}
 
 
 @router.get("/projects/{project_id}/deployments/dev/logs")

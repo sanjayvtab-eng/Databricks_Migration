@@ -225,3 +225,59 @@ def test_reconciliation_uses_exact_medallion_manifest_and_type_aware_checks(clie
     assert latest and latest['run_id']==deployed['run_id'] and len(latest['details'])==len(result['details'])
     gate=evaluate_dev_gate(db,pid)
     assert gate['status']=='PASSED' and gate['deployment_run_id']==deployed['run_id']
+
+
+def test_dev_manifest_promotes_to_test_and_passes_test_gate(client,auth_headers,db,monkeypatch):
+    from app.services.medallion import deploy_medallion_dev
+    from app.services.deployment import (
+        evaluate_dev_gate, evaluate_test_gate, promote_medallion_to_test,
+        run_reconciliation, test_promotion_precheck,
+    )
+    from app.models.entities import MigrationStageArtifactVersion
+    import app.services.databricks_client as dc
+    import app.services.deployment as dep
+
+    pid=_project_with_semantics(client,auth_headers)
+    client.post(f'/api/projects/{pid}/semantics/infer',headers=auth_headers)
+    for semantic in client.get(f'/api/projects/{pid}/semantics',headers=auth_headers).json():
+        if semantic['status']!='APPROVED' and semantic['semantic_role'] in {'FACT','DIMENSION','AGGREGATE'}:
+            client.post(f"/api/projects/{pid}/semantics/{semantic['id']}/approve",headers=auth_headers,json={'actor':'architect'})
+    client.post(f'/api/projects/{pid}/medallion/plan',headers=auth_headers,json={'environment':'DEV','catalog':'migration_dev'})
+    client.post(f'/api/projects/{pid}/medallion/generate?environment=DEV',headers=auth_headers)
+    for row in db.query(MigrationStageArtifactVersion).filter_by(project_id=pid).all():
+        if row.executable and row.validation_status=='PASSED':
+            row.review_status='APPROVED'; row.reviewer='architect'
+    db.commit()
+
+    monkeypatch.setattr(dc,'execute_sql',lambda *a,**k:[])
+    monkeypatch.setattr(dep,'_apply_table_schema_policy',lambda *a,**k:{'action':'CREATE','schema_status':'MISSING'})
+    monkeypatch.setattr(dep,'load_bronze_table',lambda *a,**k:{'status':'PASSED','rows':10})
+    dev=deploy_medallion_dev(db,pid)
+    assert dev['status']=='PASSED'
+
+    statements=[]
+    def fake_execute(sql,safe_retry=True):
+        statements.append(sql)
+        if sql.startswith('SELECT current_catalog'):
+            return [['migration_dev','default','tester']]
+        return [[10]] if sql.startswith('SELECT COUNT(*)') else [['exists']]
+    monkeypatch.setattr(dep,'execute_sql',fake_execute)
+    monkeypatch.setattr(dep,'_source_table_count',lambda *a,**k:10)
+    assert run_reconciliation(db,pid,'DEV')['status']=='PASSED'
+    assert evaluate_dev_gate(db,pid)['status']=='PASSED'
+
+    precheck=test_promotion_precheck(db,pid)
+    assert precheck['eligible'] and precheck['source_deployment_run_id']==dev['run_id']
+    promoted=promote_medallion_to_test(db,pid)
+    assert promoted['status']=='PASSED' and promoted['count']==dev['count']
+    assert any('DEEP CLONE' in sql and 'migration_test' in sql for sql in statements)
+    assert all('migration_test' in row['target_fqn'] for row in promoted['deployed'])
+    test_status=dep.deployment_status(db,pid,'TEST')
+    assert test_status['total']==promoted['count'] and test_status['passed']==promoted['count']
+
+    test_recon=run_reconciliation(db,pid,'TEST')
+    assert test_recon['status']=='PASSED' and test_recon['failed']==0
+    test_gate=evaluate_test_gate(db,pid)
+    assert test_gate['status']=='PASSED' and test_gate['deployment_run_id']==promoted['run_id']
+    lifecycle_rows=client.get(f'/api/projects/{pid}/lifecycle',headers=auth_headers).json()
+    assert next(row for row in lifecycle_rows if row['environment']=='TEST')['status']=='PASSED'
