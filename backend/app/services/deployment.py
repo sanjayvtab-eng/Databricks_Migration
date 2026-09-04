@@ -1040,6 +1040,165 @@ def evaluate_test_gate(db: Session, project_id: str) -> dict[str, Any]:
             "blockers": blockers, "deployment_run_id": deployment_run_id}
 
 
+def uat_promotion_precheck(db: Session, project_id: str, test_databricks: bool = True) -> dict[str, Any]:
+    """Validate that the exact successful TEST Medallion manifest can enter UAT."""
+    if not db.get(MigrationProject, project_id):
+        raise ValueError("Project not found")
+    blockers: list[dict[str, str]] = []
+    test_gate = db.scalars(select(MigrationQualityGate).where(
+        MigrationQualityGate.project_id == project_id,
+        MigrationQualityGate.environment == "TEST",
+    ).order_by(MigrationQualityGate.created_at.desc())).first()
+    if not test_gate or test_gate.status != "PASSED":
+        blockers.append({"code": "TEST_GATE", "message": "Latest TEST quality gate is not PASSED."})
+
+    manifest = _latest_successful_medallion_run(db, project_id, "TEST")
+    if not manifest:
+        blockers.append({"code": "TEST_MANIFEST", "message": "No complete successful TEST Medallion deployment exists."})
+    else:
+        for _, payload in manifest[1]:
+            version = db.get(MigrationStageArtifactVersion, payload.get("artifact_version_id"))
+            if not version or not version.executable or version.validation_status != "PASSED" or version.review_status != "APPROVED":
+                blockers.append({
+                    "code": "ARTIFACT_VERSION",
+                    "message": f"{payload.get('target_fqn')} TEST artifact version is not approved, executable and validated.",
+                })
+
+    open_blockers = db.scalars(select(MigrationIssue).where(
+        MigrationIssue.project_id == project_id,
+        MigrationIssue.status == "OPEN",
+        MigrationIssue.severity == "BLOCKER",
+    )).all()
+    if open_blockers:
+        blockers.append({"code": "OPEN_ISSUES", "message": f"{len(open_blockers)} open blocker issue(s) must be resolved."})
+
+    dbx = {"tested": False, "ok": None}
+    if test_databricks:
+        try:
+            rows = execute_sql("SELECT current_catalog(), current_schema(), current_user()", safe_retry=True)
+            dbx = {"tested": True, "ok": True, "result": [list(row) for row in rows]}
+        except Exception as exc:
+            blockers.append({"code": "DATABRICKS_CONNECTIVITY", "message": str(exc)})
+            dbx = {"tested": True, "ok": False, "error": str(exc)}
+
+    result = {
+        "eligible": not blockers,
+        "source_environment": "TEST",
+        "target_environment": "UAT",
+        "artifact_count": len(manifest[1]) if manifest else 0,
+        "source_deployment_run_id": manifest[0] if manifest else None,
+        "blockers": blockers,
+        "databricks": dbx,
+    }
+    _validation_evidence(db, project_id, "UAT_PRECHECK", "PASSED" if result["eligible"] else "BLOCKED",
+                         environment="UAT", validation_type="UAT_PROMOTION_PRECHECK", details=result)
+    return result
+
+
+def promote_medallion_to_uat(db: Session, project_id: str) -> dict[str, Any]:
+    """Promote the immutable, gate-approved TEST Medallion manifest into UAT."""
+    precheck = uat_promotion_precheck(db, project_id, test_databricks=True)
+    if not precheck["eligible"]:
+        raise ValueError("UAT promotion precheck blocked deployment: " + "; ".join(x["message"] for x in precheck["blockers"]))
+    manifest = _latest_successful_medallion_run(db, project_id, "TEST")
+    if not manifest:
+        raise ValueError("No complete successful TEST Medallion deployment exists")
+
+    cfg = get_settings()
+    run = MigrationRun(id=uid("RUN"), project_id=project_id, stage="UAT_DEPLOYMENT",
+                       environment="UAT", status="RUNNING")
+    db.add(run); db.commit()
+    _deployment_evidence(db, project_id, run.id, "RUNNING", environment="UAT",
+                         action="PROMOTE_TEST_TO_UAT", source_run_id=manifest[0])
+    deployed: list[dict[str, Any]] = []
+    failed_target = None
+    try:
+        for evidence, payload in sorted(
+            manifest[1],
+            key=lambda item: ({"BRONZE": 1, "SILVER": 2, "GOLD": 3}.get(str(item[1].get("layer")), 9),
+                              str(item[1].get("target_fqn") or "").lower()),
+        ):
+            source_fqn = str(payload.get("target_fqn") or "")
+            target_fqn = _replace_catalog(source_fqn, cfg.test_catalog, cfg.uat_catalog)
+            failed_target = target_fqn
+            catalog, schema, _ = _parse_target_fqn(target_fqn)
+            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            owner = _target_owner_collision(db, project_id, target_fqn)
+            if owner:
+                raise RuntimeError(
+                    f"Target ownership collision: {target_fqn} is already owned by project {owner.project_id} "
+                    f"in workspace {databricks_workspace_identity()}"
+                )
+            node = db.get(MigrationMedallionNode, payload.get("medallion_node_id"))
+            version = db.get(MigrationStageArtifactVersion, payload.get("artifact_version_id"))
+            if not node or not version:
+                raise RuntimeError(f"TEST manifest metadata missing for {source_fqn}")
+            if node.layer == "BRONZE" and node.node_type == "DELTA_TABLE":
+                execute_sql(f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {source_fqn}", safe_retry=False)
+                action = "DEEP_CLONE_TEST"
+            else:
+                promoted_sql = _replace_catalog(version.content, cfg.dev_catalog, cfg.uat_catalog)
+                promoted_sql = _replace_catalog(promoted_sql, cfg.test_catalog, cfg.uat_catalog)
+                execute_sql(promoted_sql, safe_retry=False)
+                action = "EXECUTE_PROMOTED_ARTIFACT"
+            _deployment_evidence(
+                db, project_id, run.id, "PASSED", environment="UAT", object_id=evidence.object_id,
+                target_fqn=target_fqn, source_target_fqn=source_fqn,
+                medallion_node_id=node.id, layer=node.layer,
+                artifact_version_id=version.id, artifact_version=version.version,
+                promoted_from_environment="TEST", promoted_from_run_id=manifest[0], action=action,
+            )
+            deployed.append({"target_fqn": target_fqn, "layer": node.layer, "status": "PASSED",
+                             "artifact_version_id": version.id})
+        run.status = "PASSED"; run.ended_at = datetime.utcnow(); run.checkpoint = "UAT_DEPLOYMENT_COMPLETE"
+        db.commit()
+        _deployment_evidence(db, project_id, run.id, "PASSED", environment="UAT",
+                             medallion_run_complete=True, promoted_from_run_id=manifest[0],
+                             deployed=len(deployed), expected=len(manifest[1]))
+        return {"run_id": run.id, "status": "PASSED", "source_run_id": manifest[0],
+                "count": len(deployed), "deployed": deployed}
+    except Exception as exc:
+        run.status = "FAILED"; run.ended_at = datetime.utcnow(); run.checkpoint = failed_target
+        db.commit()
+        _deployment_evidence(db, project_id, run.id, "FAILED", environment="UAT",
+                             failed_target=failed_target, error=str(exc), promoted_from_run_id=manifest[0])
+        return {"run_id": run.id, "status": "FAILED", "failed_target": failed_target,
+                "error": str(exc), "deployed": deployed}
+
+
+def evaluate_uat_gate(db: Session, project_id: str) -> dict[str, Any]:
+    blockers: list[str] = []
+    deployment = _latest_successful_medallion_run(db, project_id, "UAT")
+    deployment_run_id = deployment[0] if deployment else None
+    if not deployment:
+        blockers.append("Latest UAT deployment is not PASSED")
+    recon = db.scalars(select(MigrationReconciliation).where(
+        MigrationReconciliation.project_id == project_id,
+        MigrationReconciliation.environment == "UAT",
+    ).order_by(MigrationReconciliation.created_at.desc())).first()
+    if not recon or recon.status != "PASSED":
+        blockers.append("Latest UAT reconciliation is not PASSED")
+    open_issues = db.scalars(select(MigrationIssue).where(
+        MigrationIssue.project_id == project_id,
+        MigrationIssue.status == "OPEN",
+        MigrationIssue.severity == "BLOCKER",
+    )).all()
+    if open_issues:
+        blockers.append(f"{len(open_issues)} open blocker issue(s)")
+    status = "PASSED" if not blockers else "BLOCKED"
+    run = MigrationRun(id=uid("RUN"), project_id=project_id, stage="QUALITY_GATE",
+                       environment="UAT", status=status, ended_at=datetime.utcnow())
+    db.add(run); db.flush()
+    gate = MigrationQualityGate(id=uid("GAT"), project_id=project_id, run_id=run.id,
+                                environment="UAT", status=status,
+                                pass_count=2 if status == "PASSED" else max(0, 2 - len(blockers)),
+                                fail_count=len(blockers), blocker_count=len(blockers),
+                                deployment_version=deployment_run_id)
+    db.add(gate); db.commit()
+    return {"gate_id": gate.id, "run_id": run.id, "status": status,
+            "blockers": blockers, "deployment_run_id": deployment_run_id}
+
+
 def deployment_status(db: Session, project_id: str, environment: str = "DEV") -> dict[str, Any]:
     env = environment.upper()
     run = db.scalars(select(MigrationRun).where(

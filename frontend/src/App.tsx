@@ -271,6 +271,10 @@ export default function App() {
     [testPrecheck, setTestPrecheck] = useState<any>(null),
     [testRecon, setTestRecon] = useState<any>(null),
     [testGate, setTestGate] = useState<any>(null);
+  const [uatPromotion, setUatPromotion] = useState<any>({ status: "NOT_STARTED", logs: [] }),
+    [uatPrecheck, setUatPrecheck] = useState<any>(null),
+    [uatRecon, setUatRecon] = useState<any>(null),
+    [uatGate, setUatGate] = useState<any>(null);
   const [logView, setLogView] = useState<any[]>([]),
     [showLogs, setShowLogs] = useState(false);
   const [compat, setCompat] = useState<any>(null);
@@ -365,12 +369,16 @@ export default function App() {
       if (page === "Deployments" && id)
         setDeployment(await api(`/projects/${id}/deployments/dev/status`));
       if (page === "Waves" && id) {
-        const [status, recon]: any = await Promise.all([
+        const [status, recon, uatStatus, uatReconciliation]: any = await Promise.all([
           api(`/projects/${id}/promotions/test/status`),
           api(`/projects/${id}/promotions/test/reconciliation/latest`),
+          api(`/projects/${id}/promotions/uat/status`),
+          api(`/projects/${id}/promotions/uat/reconciliation/latest`),
         ]);
         setTestPromotion(status);
         setTestRecon(recon);
+        setUatPromotion(uatStatus);
+        setUatRecon(uatReconciliation);
       }
       if (page === "Users") setUsers(await api("/users"));
       if (page === "Administration") setDiag(await api("/system/diagnostics"));
@@ -3878,6 +3886,104 @@ export default function App() {
                     ))}</tbody>
                   </table>
                 ) : <Empty text="Run TEST Precheck, then promote the approved DEV manifest to TEST." />}
+              </Panel>
+              <Panel
+                title="TEST → UAT promotion"
+                actions={
+                  <div className="deploy-actions">
+                    <button
+                      disabled={!pid || busy}
+                      onClick={() => action(async () => {
+                        const result: any = await api(`/projects/${pid}/promotions/uat/precheck`, { method: "POST" });
+                        setUatPrecheck(result);
+                        return result;
+                      })}
+                    >
+                      <FileCheck2 size={15} /> UAT Precheck
+                    </button>
+                    <button
+                      className="primary-action"
+                      disabled={!pid || busy || uatPrecheck?.eligible !== true}
+                      onClick={() => action(async () => {
+                        const result: any = await api(`/projects/${pid}/promotions/uat/deploy`, { method: "POST" });
+                        setUatPromotion(result);
+                        return result;
+                      })}
+                    >
+                      <Play size={15} /> Promote and Deploy to UAT
+                    </button>
+                    <button
+                      disabled={!pid || busy || uatPromotion?.status !== "PASSED"}
+                      onClick={() => action(async () => {
+                        const result: any = await api(`/projects/${pid}/promotions/uat/reconcile`, { method: "POST" });
+                        setUatRecon(result);
+                        return result;
+                      })}
+                    >
+                      <Gauge size={15} /> Run UAT Reconciliation
+                    </button>
+                    <button
+                      disabled={!pid || busy || uatRecon?.status !== "PASSED"}
+                      onClick={() => action(async () => {
+                        const result: any = await api(`/projects/${pid}/promotions/uat/evaluate-gate`, { method: "POST" });
+                        setUatGate(result);
+                        return result;
+                      })}
+                    >
+                      <ShieldCheck size={15} /> Evaluate UAT Gate
+                    </button>
+                  </div>
+                }
+              >
+                <div className="notice ok">
+                  UAT promotion uses the exact artifact-version manifest that passed the TEST quality gate. Bronze data is deep-cloned from TEST; Silver and Gold artifacts are deployed with UAT catalog references.
+                </div>
+                <div className="deployment-summary">
+                  <div className="summary-stat"><span>UAT status</span><Badge s={uatPromotion?.status || "NOT_STARTED"} /></div>
+                  <div className="summary-stat"><span>Run ID</span><b>{uatPromotion?.run_id || "-"}</b></div>
+                  <div className="summary-stat"><span>Objects</span><b>{uatPromotion?.total ?? uatPromotion?.count ?? 0}</b></div>
+                  <div className="summary-stat"><span>Passed</span><b>{uatPromotion?.passed ?? 0}</b></div>
+                  <div className="summary-stat"><span>Failed</span><b>{uatPromotion?.failed ?? 0}</b></div>
+                  <div className="summary-stat"><span>UAT gate</span><Badge s={uatGate?.status || "NOT_STARTED"} /></div>
+                </div>
+                {uatPrecheck && (
+                  <div className="subsection">
+                    <h4>UAT promotion precheck</h4>
+                    <pre>{JSON.stringify(uatPrecheck, null, 2)}</pre>
+                  </div>
+                )}
+                {uatRecon?.run_id && (
+                  <div className="subsection">
+                    <h4>UAT reconciliation</h4>
+                    <div className="deployment-summary">
+                      <div className="summary-stat"><span>Status</span><Badge s={uatRecon.status} /></div>
+                      <div className="summary-stat"><span>Checked</span><b>{uatRecon.details_count || 0}</b></div>
+                      <div className="summary-stat"><span>Passed</span><b>{uatRecon.passed || 0}</b></div>
+                      <div className="summary-stat"><span>Failed</span><b>{uatRecon.failed || 0}</b></div>
+                    </div>
+                  </div>
+                )}
+                {uatGate && (
+                  <div className="subsection">
+                    <h4>UAT quality gate</h4>
+                    <pre>{JSON.stringify(uatGate, null, 2)}</pre>
+                  </div>
+                )}
+              </Panel>
+              <Panel title="UAT execution evidence">
+                {uatPromotion?.logs?.length ? (
+                  <table>
+                    <thead><tr><th>Time</th><th>Status</th><th>Target / action</th><th>Artifact version</th></tr></thead>
+                    <tbody>{uatPromotion.logs.slice().reverse().map((x: any, i: number) => (
+                      <tr key={i}>
+                        <td>{x.created_at ? new Date(x.created_at).toLocaleString() : "-"}</td>
+                        <td><Badge s={x.status} /></td>
+                        <td><code>{x.target_fqn || x.action || "-"}</code></td>
+                        <td>{x.artifact_version ? `v${x.artifact_version}` : "-"}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                ) : <Empty text="Run UAT Precheck, then promote the approved TEST manifest to UAT." />}
               </Panel>
             </>
           )}

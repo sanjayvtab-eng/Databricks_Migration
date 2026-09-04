@@ -230,8 +230,9 @@ def test_reconciliation_uses_exact_medallion_manifest_and_type_aware_checks(clie
 def test_dev_manifest_promotes_to_test_and_passes_test_gate(client,auth_headers,db,monkeypatch):
     from app.services.medallion import deploy_medallion_dev
     from app.services.deployment import (
-        evaluate_dev_gate, evaluate_test_gate, promote_medallion_to_test,
-        run_reconciliation, test_promotion_precheck,
+        evaluate_dev_gate, evaluate_test_gate, evaluate_uat_gate,
+        promote_medallion_to_test, promote_medallion_to_uat,
+        run_reconciliation, test_promotion_precheck, uat_promotion_precheck,
     )
     from app.models.entities import MigrationStageArtifactVersion
     import app.services.databricks_client as dc
@@ -281,3 +282,19 @@ def test_dev_manifest_promotes_to_test_and_passes_test_gate(client,auth_headers,
     assert test_gate['status']=='PASSED' and test_gate['deployment_run_id']==promoted['run_id']
     lifecycle_rows=client.get(f'/api/projects/{pid}/lifecycle',headers=auth_headers).json()
     assert next(row for row in lifecycle_rows if row['environment']=='TEST')['status']=='PASSED'
+
+    uat_precheck=uat_promotion_precheck(db,pid)
+    assert uat_precheck['eligible'] and uat_precheck['source_deployment_run_id']==promoted['run_id']
+    promoted_uat=promote_medallion_to_uat(db,pid)
+    assert promoted_uat['status']=='PASSED' and promoted_uat['count']==promoted['count']
+    assert any('DEEP CLONE' in sql and 'migration_test' in sql and 'migration_uat' in sql for sql in statements)
+    assert all('migration_uat' in row['target_fqn'] for row in promoted_uat['deployed'])
+    uat_status=dep.deployment_status(db,pid,'UAT')
+    assert uat_status['total']==promoted_uat['count'] and uat_status['passed']==promoted_uat['count']
+
+    uat_recon=run_reconciliation(db,pid,'UAT')
+    assert uat_recon['status']=='PASSED' and uat_recon['failed']==0
+    uat_gate=evaluate_uat_gate(db,pid)
+    assert uat_gate['status']=='PASSED' and uat_gate['deployment_run_id']==promoted_uat['run_id']
+    lifecycle_rows=client.get(f'/api/projects/{pid}/lifecycle',headers=auth_headers).json()
+    assert next(row for row in lifecycle_rows if row['environment']=='UAT')['status']=='PASSED'

@@ -17,6 +17,7 @@ from app.services.deployment import (
     dev_precheck, deploy_dev, latest_failed_dev_run, run_reconciliation,
     latest_reconciliation, evaluate_dev_gate, deployment_status,
     test_promotion_precheck, promote_medallion_to_test, evaluate_test_gate,
+    uat_promotion_precheck, promote_medallion_to_uat, evaluate_uat_gate,
 )
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
@@ -791,6 +792,53 @@ def test_promotion_logs_api(project_id:str,limit:int=1000,db:Session=Depends(get
     if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
     rows=_environment_log_rows(db,project_id,"TEST")[:max(1,min(limit,5000))]
     return {"project_id":project_id,"environment":"TEST","count":len(rows),"logs":rows}
+
+
+@router.post("/projects/{project_id}/promotions/uat/precheck")
+def uat_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return uat_promotion_precheck(db,project_id,test_databricks=True)
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.post("/projects/{project_id}/promotions/uat/deploy")
+def uat_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try:
+        result=promote_medallion_to_uat(db,project_id)
+        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        return result
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/uat/status")
+def uat_promotion_status_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return deployment_status(db,project_id,"UAT")
+
+
+@router.post("/projects/{project_id}/promotions/uat/reconcile")
+def uat_promotion_reconcile_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return run_reconciliation(db,project_id,"UAT")
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/uat/reconciliation/latest")
+def uat_reconciliation_latest_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    return latest_reconciliation(db,project_id,"UAT") or {
+        "status":"NOT_STARTED","workflow":"MEDALLION","run_id":None,
+        "passed":0,"failed":0,"details_count":0,"details":[],
+    }
+
+
+@router.post("/projects/{project_id}/promotions/uat/evaluate-gate")
+def uat_gate_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return evaluate_uat_gate(db,project_id)
+
+
+@router.get("/projects/{project_id}/promotions/uat/logs")
+def uat_promotion_logs_api(project_id:str,limit:int=1000,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    rows=_environment_log_rows(db,project_id,"UAT")[:max(1,min(limit,5000))]
+    return {"project_id":project_id,"environment":"UAT","count":len(rows),"logs":rows}
 
 
 @router.get("/projects/{project_id}/deployments/dev/logs")
