@@ -230,9 +230,9 @@ def test_reconciliation_uses_exact_medallion_manifest_and_type_aware_checks(clie
 def test_dev_manifest_promotes_to_test_and_passes_test_gate(client,auth_headers,db,monkeypatch):
     from app.services.medallion import deploy_medallion_dev
     from app.services.deployment import (
-        evaluate_dev_gate, evaluate_test_gate, evaluate_uat_gate,
-        promote_medallion_to_test, promote_medallion_to_uat,
-        run_reconciliation, test_promotion_precheck, uat_promotion_precheck,
+        evaluate_dev_gate, evaluate_test_gate, evaluate_uat_gate, evaluate_prod_gate,
+        promote_medallion_to_test, promote_medallion_to_uat, promote_medallion_to_prod,
+        run_reconciliation, test_promotion_precheck, uat_promotion_precheck, prod_promotion_precheck,
     )
     from app.models.entities import MigrationStageArtifactVersion
     import app.services.databricks_client as dc
@@ -298,3 +298,19 @@ def test_dev_manifest_promotes_to_test_and_passes_test_gate(client,auth_headers,
     assert uat_gate['status']=='PASSED' and uat_gate['deployment_run_id']==promoted_uat['run_id']
     lifecycle_rows=client.get(f'/api/projects/{pid}/lifecycle',headers=auth_headers).json()
     assert next(row for row in lifecycle_rows if row['environment']=='UAT')['status']=='PASSED'
+
+    prod_precheck=prod_promotion_precheck(db,pid)
+    assert prod_precheck['eligible'] and prod_precheck['source_deployment_run_id']==promoted_uat['run_id']
+    promoted_prod=promote_medallion_to_prod(db,pid)
+    assert promoted_prod['status']=='PASSED' and promoted_prod['count']==promoted_uat['count']
+    assert any('DEEP CLONE' in sql and 'migration_uat' in sql and 'migration_prod' in sql for sql in statements)
+    assert all('migration_prod' in row['target_fqn'] for row in promoted_prod['deployed'])
+    prod_status=dep.deployment_status(db,pid,'PROD')
+    assert prod_status['total']==promoted_prod['count'] and prod_status['passed']==promoted_prod['count']
+
+    prod_recon=run_reconciliation(db,pid,'PROD')
+    assert prod_recon['status']=='PASSED' and prod_recon['failed']==0
+    prod_gate=evaluate_prod_gate(db,pid)
+    assert prod_gate['status']=='PASSED' and prod_gate['deployment_run_id']==promoted_prod['run_id']
+    lifecycle_rows=client.get(f'/api/projects/{pid}/lifecycle',headers=auth_headers).json()
+    assert next(row for row in lifecycle_rows if row['environment']=='PROD')['status']=='PASSED'

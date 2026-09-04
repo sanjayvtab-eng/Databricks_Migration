@@ -18,6 +18,7 @@ from app.services.deployment import (
     latest_reconciliation, evaluate_dev_gate, deployment_status,
     test_promotion_precheck, promote_medallion_to_test, evaluate_test_gate,
     uat_promotion_precheck, promote_medallion_to_uat, evaluate_uat_gate,
+    prod_promotion_precheck, promote_medallion_to_prod, evaluate_prod_gate,
 )
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
@@ -839,6 +840,53 @@ def uat_promotion_logs_api(project_id:str,limit:int=1000,db:Session=Depends(get_
     if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
     rows=_environment_log_rows(db,project_id,"UAT")[:max(1,min(limit,5000))]
     return {"project_id":project_id,"environment":"UAT","count":len(rows),"logs":rows}
+
+
+@router.post("/projects/{project_id}/promotions/prod/precheck")
+def prod_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return prod_promotion_precheck(db,project_id,test_databricks=True)
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.post("/projects/{project_id}/promotions/prod/deploy")
+def prod_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try:
+        result=promote_medallion_to_prod(db,project_id)
+        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        return result
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/prod/status")
+def prod_promotion_status_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return deployment_status(db,project_id,"PROD")
+
+
+@router.post("/projects/{project_id}/promotions/prod/reconcile")
+def prod_promotion_reconcile_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    try: return run_reconciliation(db,project_id,"PROD")
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+@router.get("/projects/{project_id}/promotions/prod/reconciliation/latest")
+def prod_reconciliation_latest_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    return latest_reconciliation(db,project_id,"PROD") or {
+        "status":"NOT_STARTED","workflow":"MEDALLION","run_id":None,
+        "passed":0,"failed":0,"details_count":0,"details":[],
+    }
+
+
+@router.post("/projects/{project_id}/promotions/prod/evaluate-gate")
+def prod_gate_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
+    return evaluate_prod_gate(db,project_id)
+
+
+@router.get("/projects/{project_id}/promotions/prod/logs")
+def prod_promotion_logs_api(project_id:str,limit:int=1000,db:Session=Depends(get_db),_=Depends(auth)):
+    if not db.get(MigrationProject,project_id): raise HTTPException(404,"Project not found")
+    rows=_environment_log_rows(db,project_id,"PROD")[:max(1,min(limit,5000))]
+    return {"project_id":project_id,"environment":"PROD","count":len(rows),"logs":rows}
 
 
 @router.get("/projects/{project_id}/deployments/dev/logs")
