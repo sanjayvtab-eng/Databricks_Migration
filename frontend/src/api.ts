@@ -1,4 +1,4 @@
-const API=import.meta.env.VITE_API_URL||'http://127.0.0.1:8010/api';
+const API=import.meta.env.VITE_API_URL||'/api';
 export const token=()=>localStorage.getItem('mf_token')||'';
 export async function api<T>(path:string,init:RequestInit={}):Promise<T>{
   const h=new Headers(init.headers);
