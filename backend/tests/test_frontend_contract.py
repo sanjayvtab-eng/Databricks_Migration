@@ -13,6 +13,9 @@ def test_frontend_has_no_recovery_placeholder():
     assert "Generate stage artifacts" in app
     assert "2.3.0 SEMANTIC_MEDALLION_FACTORY" in app
 
-def test_frontend_api_defaults_to_backend_8010():
+def test_frontend_api_uses_same_origin_api_for_production():
     api = (Path(__file__).parents[2] / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
-    assert "http://127.0.0.1:8010/api" in api
+    assert "import.meta.env.VITE_API_URL||'/api'" in api
+
+    vite = (Path(__file__).parents[2] / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+    assert "'/api': 'http://127.0.0.1:8000'" in vite
