@@ -104,37 +104,6 @@ type ModRecord = {
   payload: { title?: string; status?: string; details?: any };
 };
 
-const nav = [
-  "Migration Workflow",
-  "Dashboard",
-  "Runbook",
-  "Projects",
-  "Sources",
-  "Discovery",
-  "Inventory",
-  "Dependencies",
-  "Assessment",
-  "Mappings",
-  "Compatibility",
-  "Layer Classification",
-  "Medallion Design",
-  "Conversion Plans",
-  "Artifacts",
-  "AI Remediation",
-  "Reviews",
-  "Issues",
-  "Data Quality",
-  "Reconciliation",
-  "Lifecycle",
-  "Deployments",
-  "Waves",
-  "Cutover",
-  "Decommission",
-  "Governance",
-  "Audit",
-  "Users",
-  "Administration",
-];
 const icons: any = {
   "Migration Workflow": Workflow,
   Dashboard: Activity,
@@ -1058,41 +1027,31 @@ export default function App() {
   }
   const navGroups = [
     {
-      label: "OVERVIEW",
-      items: ["Migration Workflow", "Dashboard", "Runbook", "Projects", "Sources"],
+      label: "START & SETUP",
+      items: ["Migration Workflow", "Projects", "Sources"],
     },
     {
-      label: "DISCOVER & PLAN",
+      label: "DISCOVER & DESIGN",
       items: [
         "Discovery",
         "Inventory",
         "Dependencies",
-        "Assessment",
-        "Mappings",
         "Compatibility",
         "Layer Classification",
         "Medallion Design",
-        "Conversion Plans",
       ],
     },
     {
-      label: "BUILD & VALIDATE",
-      items: [
-        "Artifacts",
-        "AI Remediation",
-        "Reviews",
-        "Issues",
-        "Data Quality",
-        "Reconciliation",
-      ],
+      label: "VALIDATE & RESOLVE",
+      items: ["Reviews", "AI Remediation", "Issues", "Reconciliation"],
     },
     {
-      label: "PROMOTE & OPERATE",
-      items: ["Lifecycle", "Deployments", "Waves", "Cutover", "Decommission"],
+      label: "PROMOTE",
+      items: ["Deployments", "Waves", "Lifecycle"],
     },
     {
-      label: "CONTROL",
-      items: ["Governance", "Audit", "Users", "Administration"],
+      label: "CLOSE",
+      items: ["Cutover", "Decommission"],
     },
   ];
   return (
