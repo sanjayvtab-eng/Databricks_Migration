@@ -2,13 +2,31 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from app.core.config import get_settings
-from app.core.database import Base, engine
+from app.core.database import Base, SessionLocal, engine
+from app.core.security import hash_password
 from app.api.routes import router
+from app.models.entities import User
 from app.models import canonical
+from app.services.engine import uid
+from sqlalchemy import func, select
 
 s=get_settings()
 Base.metadata.create_all(engine)
+if s.bootstrap_admin_username and s.bootstrap_admin_password:
+    if len(s.bootstrap_admin_password) < 12:
+        raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 12 characters")
+    with SessionLocal() as db:
+        if db.scalar(select(func.count()).select_from(User)) == 0:
+            db.add(User(
+                id=uid("USR"),
+                username=s.bootstrap_admin_username,
+                password_hash=hash_password(s.bootstrap_admin_password),
+                role="ADMIN",
+            ))
+            db.commit()
 app=FastAPI(title=s.app_name,version="2.3.0")
 app.add_middleware(CORSMiddleware,allow_origins=s.origins,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
@@ -27,3 +45,7 @@ app.add_middleware(SecurityHeaders)
 app.include_router(router)
 @app.get("/health", tags=["System"])
 def root_health(): return {"status":"ok","service":"migration-factory"}
+
+frontend_dir = Path("/app/frontend_dist")
+if frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
