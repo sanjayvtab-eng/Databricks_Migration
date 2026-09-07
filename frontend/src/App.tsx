@@ -105,6 +105,7 @@ type ModRecord = {
 };
 
 const nav = [
+  "Migration Workflow",
   "Dashboard",
   "Runbook",
   "Projects",
@@ -135,6 +136,7 @@ const nav = [
   "Administration",
 ];
 const icons: any = {
+  "Migration Workflow": Workflow,
   Dashboard: Activity,
   Runbook: BookOpen,
   Projects: Boxes,
@@ -242,7 +244,7 @@ function Empty({ text }: { text: string }) {
 
 export default function App() {
   const [ready, setReady] = useState(!!localStorage.getItem("mf_token"));
-  const [page, setPage] = useState("Dashboard");
+  const [page, setPage] = useState("Migration Workflow");
   const [projects, setProjects] = useState<Project[]>([]),
     [pid, setPid] = useState("");
   const [dash, setDash] = useState<any>({}),
@@ -279,6 +281,7 @@ export default function App() {
     [prodPrecheck, setProdPrecheck] = useState<any>(null),
     [prodRecon, setProdRecon] = useState<any>(null),
     [prodGate, setProdGate] = useState<any>(null);
+  const [workflowOps, setWorkflowOps] = useState<any>({ cutover: [], decommission: [] });
   const [logView, setLogView] = useState<any[]>([]),
     [showLogs, setShowLogs] = useState(false);
   const [compat, setCompat] = useState<any>(null);
@@ -387,6 +390,23 @@ export default function App() {
         setUatRecon(uatReconciliation);
         setProdPromotion(prodStatus);
         setProdRecon(prodReconciliation);
+      }
+      if (page === "Migration Workflow" && id) {
+        const [compatibility, mp, sm, ma, devRecon, cutover, decommission]: any = await Promise.all([
+          api(`/projects/${id}/compatibility/summary`),
+          api(`/projects/${id}/medallion/plan?environment=DEV`),
+          api(`/projects/${id}/semantics`),
+          api(`/projects/${id}/medallion/artifacts?environment=DEV`),
+          api(`/projects/${id}/deployments/dev/reconciliation/latest`),
+          api(`/projects/${id}/module/cutover`),
+          api(`/projects/${id}/module/decommission`),
+        ]);
+        setCompat(compatibility);
+        setMedallion(mp);
+        setSemantics(sm);
+        setMedArts(ma);
+        setReconResult(devRecon);
+        setWorkflowOps({ cutover, decommission });
       }
       if (page === "Users") setUsers(await api("/users"));
       if (page === "Administration") setDiag(await api("/system/diagnostics"));
@@ -893,6 +913,131 @@ export default function App() {
     [inventory, search],
   );
   const genericModule = moduleMap[page];
+  const environmentPassed = (environment: string) =>
+    life.find((x) => x.environment === environment)?.status === "PASSED";
+  const medallionNodeCount = Array.isArray(medallion?.nodes)
+    ? medallion.nodes.length
+    : 0;
+  const approvedMedallionArtifacts = medArts.filter(
+    (x: any) =>
+      x.executable &&
+      x.validation_status === "PASSED" &&
+      x.review_status === "APPROVED",
+  ).length;
+  const operationalRecordComplete = (rows: any[]) =>
+    rows.some((row: any) =>
+      ["PASSED", "APPROVED", "COMPLETED", "CLOSED"].includes(
+        String(row?.payload?.status || "").toUpperCase(),
+      ),
+    );
+  const workflowSteps = [
+    {
+      phase: "SETUP",
+      title: "Create or select a project",
+      description: "Choose the project that will own all migration metadata and evidence.",
+      page: "Projects",
+      complete: !!current,
+      evidence: current ? current.name : "No project selected",
+    },
+    {
+      phase: "SETUP",
+      title: "Configure the SQL Server source",
+      description: "Add the source profile and verify the live connection before discovery.",
+      page: "Sources",
+      complete: sources.length > 0,
+      evidence: `${sources.length} source profile${sources.length === 1 ? "" : "s"}`,
+    },
+    {
+      phase: "DISCOVER",
+      title: "Run source discovery",
+      description: "Capture tables, views, functions, procedures, columns and dependencies.",
+      page: "Discovery",
+      complete: inventory.length > 0,
+      evidence: `${inventory.length} objects discovered`,
+    },
+    {
+      phase: "DESIGN",
+      title: "Review architecture readiness",
+      description: "Review inventory, dependencies, compatibility and selected Medallion layers.",
+      page: "Compatibility",
+      complete: inventory.length > 0 && classes.length > 0 && compat !== null,
+      evidence: compat
+        ? `${compat.deterministic_coverage_pct ?? 0}% deterministic compatibility`
+        : "Compatibility review pending",
+    },
+    {
+      phase: "DESIGN",
+      title: "Build the semantic Medallion design",
+      description: "Analyze consumers, approve semantics and build the Bronze/Silver/Gold plan.",
+      page: "Medallion Design",
+      complete: medallionNodeCount > 0 && semantics.some((x: any) => x.status === "APPROVED"),
+      evidence: `${medallionNodeCount} planned nodes · ${semantics.filter((x: any) => x.status === "APPROVED").length} approved semantics`,
+    },
+    {
+      phase: "GOVERN",
+      title: "Generate, validate and approve artifacts",
+      description: "Approve only executable artifact versions that passed static validation.",
+      page: "Reviews",
+      complete: medArts.length > 0 && approvedMedallionArtifacts === medArts.length,
+      evidence: `${approvedMedallionArtifacts} of ${medArts.length} artifacts approved`,
+    },
+    {
+      phase: "DEV",
+      title: "Deploy and validate DEV",
+      description: "Deploy Medallion DEV, run reconciliation and evaluate the DEV quality gate.",
+      page: environmentPassed("DEV") ? "Lifecycle" : reconResult?.status === "PASSED" ? "Deployments" : "Medallion Design",
+      complete: environmentPassed("DEV"),
+      evidence: environmentPassed("DEV") ? "DEV quality gate passed" : "DEV deployment or validation pending",
+    },
+    {
+      phase: "TEST",
+      title: "Promote and validate TEST",
+      description: "Run TEST precheck, deployment, reconciliation and quality gate.",
+      page: "Waves",
+      complete: environmentPassed("TEST"),
+      evidence: environmentPassed("TEST") ? "TEST quality gate passed" : "TEST promotion pending",
+    },
+    {
+      phase: "UAT",
+      title: "Promote and validate UAT",
+      description: "Run UAT precheck, deployment, reconciliation and quality gate.",
+      page: "Waves",
+      complete: environmentPassed("UAT"),
+      evidence: environmentPassed("UAT") ? "UAT quality gate passed" : "UAT promotion pending",
+    },
+    {
+      phase: "PROD",
+      title: "Promote and validate PROD",
+      description: "Run PROD precheck, deployment, reconciliation and final quality gate.",
+      page: "Waves",
+      complete: environmentPassed("PROD"),
+      evidence: environmentPassed("PROD") ? "PROD quality gate passed" : "PROD promotion pending",
+    },
+    {
+      phase: "CLOSE",
+      title: "Complete production cutover",
+      description: "Record consumer switch-over and production acceptance.",
+      page: "Cutover",
+      complete: operationalRecordComplete(workflowOps.cutover || []),
+      evidence: operationalRecordComplete(workflowOps.cutover || []) ? "Cutover completed" : "Cutover record pending",
+    },
+    {
+      phase: "CLOSE",
+      title: "Approve source decommission",
+      description: "Retire the legacy source only after cutover approval and monitoring.",
+      page: "Decommission",
+      complete: operationalRecordComplete(workflowOps.decommission || []),
+      evidence: operationalRecordComplete(workflowOps.decommission || []) ? "Migration formally closed" : "Decommission approval pending",
+    },
+  ];
+  const nextWorkflowIndex = workflowSteps.findIndex((step) => !step.complete);
+  const workflowComplete = nextWorkflowIndex === -1;
+  const workflowProgress = Math.round(
+    (workflowSteps.filter((step) => step.complete).length / workflowSteps.length) * 100,
+  );
+  const openBlockers = issues.filter(
+    (x: any) => x.status === "OPEN" && x.severity === "BLOCKER",
+  ).length;
   function addRecord() {
     if (!pid) return;
     const title = prompt(`${page} title`);
@@ -914,7 +1059,7 @@ export default function App() {
   const navGroups = [
     {
       label: "OVERVIEW",
-      items: ["Dashboard", "Runbook", "Projects", "Sources"],
+      items: ["Migration Workflow", "Dashboard", "Runbook", "Projects", "Sources"],
     },
     {
       label: "DISCOVER & PLAN",
@@ -1056,6 +1201,93 @@ export default function App() {
             <div className={msg.includes("success") ? "notice ok" : "notice"}>
               {msg}
             </div>
+          )}
+          {page === "Migration Workflow" && (
+            <>
+              <div className="workflow-hero">
+                <div>
+                  <div className="hero-kicker"><Workflow size={15} /> Guided migration journey</div>
+                  <h1>{current?.name || "Start your SQL Server migration"}</h1>
+                  <p>
+                    Follow one governed path from project setup through PROD validation, cutover and source retirement.
+                    Existing migration functions remain on their original pages.
+                  </p>
+                  <div className="workflow-next">
+                    <span>{workflowComplete ? "WORKFLOW COMPLETE" : "NEXT REQUIRED STEP"}</span>
+                    <b>{workflowComplete ? "Migration formally closed" : workflowSteps[nextWorkflowIndex]?.title}</b>
+                    {!workflowComplete && (
+                      <button onClick={() => setPage(workflowSteps[nextWorkflowIndex].page)}>
+                        Continue to {workflowSteps[nextWorkflowIndex].page} <ChevronRight size={15} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="workflow-progress">
+                  <strong>{workflowProgress}%</strong>
+                  <span>overall progress</span>
+                  <div><i style={{ width: `${workflowProgress}%` }} /></div>
+                  <small>{workflowSteps.filter((step) => step.complete).length} of {workflowSteps.length} stages completed</small>
+                </div>
+              </div>
+              {openBlockers > 0 && (
+                <div className="workflow-blocker">
+                  <ShieldAlert size={18} />
+                  <div><b>{openBlockers} open blocker issue{openBlockers === 1 ? "" : "s"}</b><span>Resolve these before the next governed deployment gate.</span></div>
+                  <button onClick={() => setPage("Issues")}>Open Issues</button>
+                </div>
+              )}
+              <div className="workflow-layout">
+                <Panel title="Start-to-finish workflow">
+                  <div className="workflow-list">
+                    {workflowSteps.map((step, index) => {
+                      const state = step.complete ? "complete" : index === nextWorkflowIndex ? "current" : "locked";
+                      return (
+                        <div className={`workflow-step ${state}`} key={step.title}>
+                          <div className="workflow-step-marker">
+                            {step.complete ? <CheckCircle2 size={18} /> : <span>{index + 1}</span>}
+                          </div>
+                          <div className="workflow-step-copy">
+                            <small>{step.phase}</small>
+                            <b>{step.title}</b>
+                            <p>{step.description}</p>
+                            <em>{step.evidence}</em>
+                          </div>
+                          <div className="workflow-step-action">
+                            <Badge s={step.complete ? "PASSED" : state === "current" ? "IN_PROGRESS" : "LOCKED"} />
+                            <button disabled={state === "locked"} onClick={() => setPage(step.page)}>
+                              {step.complete ? "Review" : "Open step"} <ChevronRight size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Panel>
+                <div className="workflow-side">
+                  <Panel title="Environment gates">
+                    <div className="workflow-gates">
+                      {life.map((x) => (
+                        <div key={x.environment}>
+                          <span>{x.environment}</span><Badge s={x.status} />
+                          <small>{x.pass_count} passed · {x.fail_count} failed · {x.review_blockers} blockers</small>
+                        </div>
+                      ))}
+                    </div>
+                  </Panel>
+                  <Panel title="How to use this page">
+                    <div className="workflow-help">
+                      <p><b>1.</b> Complete the highlighted current step.</p>
+                      <p><b>2.</b> Return here after the action finishes.</p>
+                      <p><b>3.</b> Click Refresh to load the latest evidence.</p>
+                      <p><b>4.</b> Future steps unlock in sequence.</p>
+                    </div>
+                    <div className="notice">
+                      This project uses the Semantic Medallion path. Legacy Mappings, Conversion Plans, Artifacts and Deploy Approved to DEV are not part of this guided journey.
+                    </div>
+                  </Panel>
+                </div>
+              </div>
+            </>
           )}
           {page === "Dashboard" && (
             <>
