@@ -338,12 +338,17 @@ export default function App() {
         setAiPlan(plan);
         setAiProvider(provider);
       }
-      if (page === "Deployments" && id)
-        setReconResult(
-          await api(`/projects/${id}/deployments/dev/reconciliation/latest`),
-        );
-      if (page === "Deployments" && id)
-        setDeployment(await api(`/projects/${id}/deployments/dev/status`));
+      if (page === "Deployments" && id) {
+        const [reconciliation, legacyDeployment, medallionDeployment]: any =
+          await Promise.all([
+            api(`/projects/${id}/deployments/dev/reconciliation/latest`),
+            api(`/projects/${id}/deployments/dev/status`),
+            api(`/projects/${id}/medallion/deployments/dev/status`),
+          ]);
+        setReconResult(reconciliation);
+        setDeployment(legacyDeployment);
+        setMedDeployment(medallionDeployment);
+      }
       if (page === "Waves" && id) {
         const [status, recon, uatStatus, uatReconciliation, prodStatus, prodReconciliation]: any = await Promise.all([
           api(`/projects/${id}/promotions/test/status`),
@@ -906,6 +911,7 @@ export default function App() {
       title: "Create or select a project",
       description: "Choose the project that will own all migration metadata and evidence.",
       page: "Projects",
+      action: "Create or select the migration project",
       complete: !!current,
       evidence: current ? current.name : "No project selected",
     },
@@ -914,6 +920,7 @@ export default function App() {
       title: "Configure the SQL Server source",
       description: "Add the source profile and verify the live connection before discovery.",
       page: "Sources",
+      action: "Configure and verify the SQL Server source",
       complete: sources.length > 0,
       evidence: `${sources.length} source profile${sources.length === 1 ? "" : "s"}`,
     },
@@ -922,6 +929,7 @@ export default function App() {
       title: "Run source discovery",
       description: "Capture tables, views, functions, procedures, columns and dependencies.",
       page: "Discovery",
+      action: "Capture the source migration inventory",
       complete: inventory.length > 0,
       evidence: `${inventory.length} objects discovered`,
     },
@@ -930,6 +938,7 @@ export default function App() {
       title: "Review architecture readiness",
       description: "Review inventory, dependencies, compatibility and selected Medallion layers.",
       page: "Compatibility",
+      action: "Review migration architecture readiness",
       complete: inventory.length > 0 && classes.length > 0 && compat !== null,
       evidence: compat
         ? `${compat.deterministic_coverage_pct ?? 0}% deterministic compatibility`
@@ -940,6 +949,7 @@ export default function App() {
       title: "Build the semantic Medallion design",
       description: "Analyze consumers, approve semantics and build the Bronze/Silver/Gold plan.",
       page: "Medallion Design",
+      action: "Build the governed Medallion design",
       complete: medallionNodeCount > 0 && semantics.some((x: any) => x.status === "APPROVED"),
       evidence: `${medallionNodeCount} planned nodes · ${semantics.filter((x: any) => x.status === "APPROVED").length} approved semantics`,
     },
@@ -948,6 +958,7 @@ export default function App() {
       title: "Generate, validate and approve artifacts",
       description: "Approve only executable artifact versions that passed static validation.",
       page: "Reviews",
+      action: "Validate and approve deployment artifacts",
       complete: medArts.length > 0 && approvedMedallionArtifacts === medArts.length,
       evidence: `${approvedMedallionArtifacts} of ${medArts.length} artifacts approved`,
     },
@@ -956,6 +967,7 @@ export default function App() {
       title: "Deploy and validate DEV",
       description: "Deploy Medallion DEV, run reconciliation and evaluate the DEV quality gate.",
       page: environmentPassed("DEV") ? "Lifecycle" : "Deployments",
+      action: "Deploy and validate the DEV release",
       complete: environmentPassed("DEV"),
       evidence: environmentPassed("DEV") ? "DEV quality gate passed" : "DEV deployment or validation pending",
     },
@@ -964,6 +976,7 @@ export default function App() {
       title: "Promote and validate TEST",
       description: "Run TEST precheck, deployment, reconciliation and quality gate.",
       page: "Waves",
+      action: "Promote the validated DEV release to TEST",
       complete: environmentPassed("TEST"),
       evidence: environmentPassed("TEST") ? "TEST quality gate passed" : "TEST promotion pending",
     },
@@ -972,6 +985,7 @@ export default function App() {
       title: "Promote and validate UAT",
       description: "Run UAT precheck, deployment, reconciliation and quality gate.",
       page: "Waves",
+      action: "Promote the validated TEST release to UAT",
       complete: environmentPassed("UAT"),
       evidence: environmentPassed("UAT") ? "UAT quality gate passed" : "UAT promotion pending",
     },
@@ -980,6 +994,7 @@ export default function App() {
       title: "Promote and validate PROD",
       description: "Run PROD precheck, deployment, reconciliation and final quality gate.",
       page: "Waves",
+      action: "Authorize the accepted UAT release for PROD",
       complete: environmentPassed("PROD"),
       evidence: environmentPassed("PROD") ? "PROD quality gate passed" : "PROD promotion pending",
     },
@@ -988,6 +1003,7 @@ export default function App() {
       title: "Complete production cutover",
       description: "Record consumer switch-over and production acceptance.",
       page: "Cutover",
+      action: "Record production cutover and consumer acceptance",
       complete: operationalRecordComplete(workflowOps.cutover || []),
       evidence: operationalRecordComplete(workflowOps.cutover || []) ? "Cutover completed" : "Cutover record pending",
     },
@@ -996,6 +1012,7 @@ export default function App() {
       title: "Approve source decommission",
       description: "Retire the legacy source only after cutover approval and monitoring.",
       page: "Decommission",
+      action: "Approve retirement of the legacy source",
       complete: operationalRecordComplete(workflowOps.decommission || []),
       evidence: operationalRecordComplete(workflowOps.decommission || []) ? "Migration formally closed" : "Decommission approval pending",
     },
@@ -1175,11 +1192,11 @@ export default function App() {
                     Existing migration functions remain on their original pages.
                   </p>
                   <div className="workflow-next">
-                    <span>{workflowComplete ? "WORKFLOW COMPLETE" : "NEXT REQUIRED STEP"}</span>
+                    <span>{workflowComplete ? "WORKFLOW COMPLETE" : "CURRENT REQUIRED OPERATION"}</span>
                     <b>{workflowComplete ? "Migration formally closed" : workflowSteps[nextWorkflowIndex]?.title}</b>
                     {!workflowComplete && (
                       <button onClick={() => setPage(workflowSteps[nextWorkflowIndex].page)}>
-                        Continue to {workflowSteps[nextWorkflowIndex].page} <ChevronRight size={15} />
+                        {workflowSteps[nextWorkflowIndex].action} <ChevronRight size={15} />
                       </button>
                     )}
                   </div>
@@ -1217,7 +1234,7 @@ export default function App() {
                           <div className="workflow-step-action">
                             <Badge s={step.complete ? "PASSED" : state === "current" ? "IN_PROGRESS" : "LOCKED"} />
                             <button disabled={state === "locked"} onClick={() => setPage(step.page)}>
-                              {step.complete ? "Review" : "Open step"} <ChevronRight size={14} />
+                              {step.complete ? "Review completion evidence" : step.action} <ChevronRight size={14} />
                             </button>
                           </div>
                         </div>
@@ -3580,9 +3597,10 @@ export default function App() {
                     <button
                       className="primary-action"
                       disabled={!pid || busy}
+                      title="Open the approved Medallion plan and deploy its data products to DEV"
                       onClick={() => setPage("Medallion Design")}
                     >
-                      <Layers3 size={15} /> Open deployment
+                      <Layers3 size={15} /> Deploy approved data products to DEV
                     </button>
                   </div>
                   <div className="dev-stage-card">
@@ -3593,10 +3611,11 @@ export default function App() {
                       <p>Compare deployed targets with the source evidence.</p>
                     </div>
                     <button
-                      disabled={!pid || busy}
+                      disabled={!pid || busy || medDeployment?.status !== "PASSED"}
+                      title={medDeployment?.status === "PASSED" ? "Validate deployed DEV data products against source evidence" : "Complete the Medallion DEV deployment first"}
                       onClick={runDevReconciliation}
                     >
-                      <Gauge size={15} /> Run reconciliation
+                      <Gauge size={15} /> Validate deployed DEV data products
                     </button>
                   </div>
                   <div className="dev-stage-card">
@@ -3608,6 +3627,7 @@ export default function App() {
                     </div>
                     <button
                       disabled={!pid || busy || reconResult?.status !== "PASSED"}
+                      title={reconResult?.status === "PASSED" ? "Approve the validated DEV release for TEST promotion" : "DEV reconciliation must pass before gate evaluation"}
                       onClick={() =>
                         action(async () => {
                           const r: any = await api(
@@ -3619,7 +3639,7 @@ export default function App() {
                         })
                       }
                     >
-                      <ShieldCheck size={15} /> Evaluate gate
+                      <ShieldCheck size={15} /> Approve DEV release for TEST
                     </button>
                   </div>
                 </div>
@@ -3921,7 +3941,7 @@ export default function App() {
               {environmentPassed("DEV") && (
                 <div className="dev-next-action">
                   <button className="primary-action" onClick={() => setPage("Waves")}>
-                    Continue to TEST promotion <ChevronRight size={15} />
+                    Promote validated DEV release to TEST <ChevronRight size={15} />
                   </button>
                 </div>
               )}
@@ -4025,7 +4045,7 @@ export default function App() {
                 actions={
                   <div className="deploy-actions">
                     <button
-                      disabled={!pid || busy}
+                      disabled={!pid || busy || !environmentPassed("DEV")}
                       onClick={() => action(async () => {
                         const result: any = await api(`/projects/${pid}/promotions/test/precheck`, { method: "POST" });
                         setTestPrecheck(result);
@@ -4077,7 +4097,7 @@ export default function App() {
                   <div className="summary-stat"><span>Objects</span><b>{testPromotion?.total ?? testPromotion?.count ?? 0}</b></div>
                   <div className="summary-stat"><span>Passed</span><b>{testPromotion?.passed ?? 0}</b></div>
                   <div className="summary-stat"><span>Failed</span><b>{testPromotion?.failed ?? 0}</b></div>
-                  <div className="summary-stat"><span>TEST gate</span><Badge s={testGate?.status || "NOT_STARTED"} /></div>
+                  <div className="summary-stat"><span>TEST gate</span><Badge s={testGate?.status || (environmentPassed("TEST") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
                 {testPrecheck && (
                   <div className="subsection">
@@ -4102,6 +4122,21 @@ export default function App() {
                     <pre>{JSON.stringify(testGate, null, 2)}</pre>
                   </div>
                 )}
+                {environmentPassed("TEST") && (
+                  <div className="business-next">
+                    <div>
+                      <span>BUSINESS OUTCOME</span>
+                      <b>TEST validation passed</b>
+                      <p>The validated release is ready for business acceptance testing in UAT.</p>
+                    </div>
+                    <button
+                      className="primary-action"
+                      onClick={() => document.getElementById("uat-promotion")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                    >
+                      Begin UAT acceptance validation <ChevronRight size={15} />
+                    </button>
+                  </div>
+                )}
               </Panel>
               <Panel title="TEST execution evidence">
                 {testPromotion?.logs?.length ? (
@@ -4118,12 +4153,13 @@ export default function App() {
                   </table>
                 ) : <Empty text="Run TEST Precheck, then promote the approved DEV manifest to TEST." />}
               </Panel>
+              <div id="uat-promotion" className="promotion-anchor">
               <Panel
                 title="TEST → UAT promotion"
                 actions={
                   <div className="deploy-actions">
                     <button
-                      disabled={!pid || busy}
+                      disabled={!pid || busy || !environmentPassed("TEST")}
                       onClick={() => action(async () => {
                         const result: any = await api(`/projects/${pid}/promotions/uat/precheck`, { method: "POST" });
                         setUatPrecheck(result);
@@ -4175,7 +4211,7 @@ export default function App() {
                   <div className="summary-stat"><span>Objects</span><b>{uatPromotion?.total ?? uatPromotion?.count ?? 0}</b></div>
                   <div className="summary-stat"><span>Passed</span><b>{uatPromotion?.passed ?? 0}</b></div>
                   <div className="summary-stat"><span>Failed</span><b>{uatPromotion?.failed ?? 0}</b></div>
-                  <div className="summary-stat"><span>UAT gate</span><Badge s={uatGate?.status || "NOT_STARTED"} /></div>
+                  <div className="summary-stat"><span>UAT gate</span><Badge s={uatGate?.status || (environmentPassed("UAT") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
                 {uatPrecheck && (
                   <div className="subsection">
@@ -4200,7 +4236,23 @@ export default function App() {
                     <pre>{JSON.stringify(uatGate, null, 2)}</pre>
                   </div>
                 )}
+                {environmentPassed("UAT") && (
+                  <div className="business-next">
+                    <div>
+                      <span>BUSINESS OUTCOME</span>
+                      <b>Business acceptance completed</b>
+                      <p>The accepted release is eligible for final production readiness validation.</p>
+                    </div>
+                    <button
+                      className="primary-action"
+                      onClick={() => document.getElementById("prod-promotion")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                    >
+                      Validate production release readiness <ChevronRight size={15} />
+                    </button>
+                  </div>
+                )}
               </Panel>
+              </div>
               <Panel title="UAT execution evidence">
                 {uatPromotion?.logs?.length ? (
                   <table>
@@ -4216,11 +4268,12 @@ export default function App() {
                   </table>
                 ) : <Empty text="Run UAT Precheck, then promote the approved TEST manifest to UAT." />}
               </Panel>
+              <div id="prod-promotion" className="promotion-anchor">
               <Panel
                 title="UAT → PROD promotion"
                 actions={
                   <div className="deploy-actions">
-                    <button disabled={!pid || busy} onClick={() => action(async () => {
+                    <button disabled={!pid || busy || !environmentPassed("UAT")} onClick={() => action(async () => {
                       const result: any = await api(`/projects/${pid}/promotions/prod/precheck`, { method: "POST" });
                       setProdPrecheck(result); return result;
                     })}>
@@ -4259,7 +4312,7 @@ export default function App() {
                   <div className="summary-stat"><span>Objects</span><b>{prodPromotion?.total ?? prodPromotion?.count ?? 0}</b></div>
                   <div className="summary-stat"><span>Passed</span><b>{prodPromotion?.passed ?? 0}</b></div>
                   <div className="summary-stat"><span>Failed</span><b>{prodPromotion?.failed ?? 0}</b></div>
-                  <div className="summary-stat"><span>PROD gate</span><Badge s={prodGate?.status || "NOT_STARTED"} /></div>
+                  <div className="summary-stat"><span>PROD gate</span><Badge s={prodGate?.status || (environmentPassed("PROD") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
                 {prodPrecheck && <div className="subsection"><h4>PROD promotion precheck</h4><pre>{JSON.stringify(prodPrecheck, null, 2)}</pre></div>}
                 {prodRecon?.run_id && (
@@ -4274,7 +4327,20 @@ export default function App() {
                   </div>
                 )}
                 {prodGate && <div className="subsection"><h4>PROD quality gate</h4><pre>{JSON.stringify(prodGate, null, 2)}</pre></div>}
+                {environmentPassed("PROD") && (
+                  <div className="business-next">
+                    <div>
+                      <span>BUSINESS OUTCOME</span>
+                      <b>Production release validated</b>
+                      <p>The migration is technically complete and ready for consumer switch-over.</p>
+                    </div>
+                    <button className="primary-action" onClick={() => setPage("Cutover")}>
+                      Record production cutover and acceptance <ChevronRight size={15} />
+                    </button>
+                  </div>
+                )}
               </Panel>
+              </div>
               <Panel title="PROD execution evidence">
                 {prodPromotion?.logs?.length ? (
                   <table>
