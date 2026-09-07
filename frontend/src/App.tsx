@@ -338,7 +338,7 @@ export default function App() {
         setAiPlan(plan);
         setAiProvider(provider);
       }
-      if (page === "Reconciliation" && id)
+      if (page === "Deployments" && id)
         setReconResult(
           await api(`/projects/${id}/deployments/dev/reconciliation/latest`),
         );
@@ -1048,13 +1048,15 @@ export default function App() {
     },
     {
       label: "PROMOTE",
-      items: ["Deployments", "Reconciliation", "Waves", "Lifecycle"],
+      items: ["Deployments", "Waves", "Lifecycle"],
     },
     {
       label: "CLOSE",
       items: ["Cutover", "Decommission"],
     },
   ];
+  const displayPage = (name: string) =>
+    name === "Deployments" ? "DEV Deployment" : name;
   return (
     <div className={`shell ${collapsed ? "collapsed" : ""}`}>
       <aside>
@@ -1091,13 +1093,13 @@ export default function App() {
                 const I = icons[n] || FileCode2;
                 return (
                   <button
-                    title={collapsed ? n : undefined}
+                    title={collapsed ? displayPage(n) : undefined}
                     className={page === n ? "active" : ""}
                     onClick={() => setPage(n)}
                     key={n}
                   >
                     <I size={17} />
-                    <span>{n}</span>
+                    <span>{displayPage(n)}</span>
                     {page === n && (
                       <ChevronRight className="nav-arrow" size={14} />
                     )}
@@ -1128,7 +1130,7 @@ export default function App() {
         <header>
           <div className="header-title">
             <div className="eyebrow">SQL SERVER → DATABRICKS</div>
-            <h2>{page}</h2>
+            <h2>{displayPage(page)}</h2>
             <p>
               Metadata-first migration orchestration with governed promotion and
               deterministic validation
@@ -3562,18 +3564,67 @@ export default function App() {
           )}
           {page === "Deployments" && (
             <>
-              <Panel title="1. Deploy Medallion to DEV">
-                <p>Deploy approved Bronze, Silver and Gold artifacts from Medallion Design. After the run succeeds, open Reconciliation to validate the deployed objects and evaluate the DEV gate.</p>
-                <div className="deploy-actions">
-                  <button disabled={!pid || busy} onClick={() => setPage("Medallion Design")}>
-                    <Layers3 size={15} /> Open Medallion Design to deploy
-                  </button>
-                  <button disabled={!pid || busy} onClick={() => setPage("Reconciliation")}>
-                    <ChevronRight size={15} /> Next: DEV Reconciliation and Gate
-                  </button>
+              <Panel title="DEV deployment and validation">
+                <p className="section-caption">
+                  Complete these three steps in order. This is the only DEV
+                  promotion workspace required after artifact approval.
+                </p>
+                <div className="dev-stage-flow">
+                  <div className="dev-stage-card">
+                    <div className="dev-stage-number">1</div>
+                    <div>
+                      <span>DEPLOY</span>
+                      <h4>Deploy Medallion to DEV</h4>
+                      <p>Deploy approved Bronze, Silver and Gold artifacts.</p>
+                    </div>
+                    <button
+                      className="primary-action"
+                      disabled={!pid || busy}
+                      onClick={() => setPage("Medallion Design")}
+                    >
+                      <Layers3 size={15} /> Open deployment
+                    </button>
+                  </div>
+                  <div className="dev-stage-card">
+                    <div className="dev-stage-number">2</div>
+                    <div>
+                      <span>VALIDATE</span>
+                      <h4>Run DEV reconciliation</h4>
+                      <p>Compare deployed targets with the source evidence.</p>
+                    </div>
+                    <button
+                      disabled={!pid || busy}
+                      onClick={runDevReconciliation}
+                    >
+                      <Gauge size={15} /> Run reconciliation
+                    </button>
+                  </div>
+                  <div className="dev-stage-card">
+                    <div className="dev-stage-number">3</div>
+                    <div>
+                      <span>APPROVE</span>
+                      <h4>Evaluate DEV gate</h4>
+                      <p>Approve DEV only after reconciliation passes.</p>
+                    </div>
+                    <button
+                      disabled={!pid || busy || reconResult?.status !== "PASSED"}
+                      onClick={() =>
+                        action(async () => {
+                          const r: any = await api(
+                            `/projects/${pid}/deployments/dev/evaluate-gate`,
+                            { method: "POST" },
+                          );
+                          setGateResult(r);
+                          return r;
+                        })
+                      }
+                    >
+                      <ShieldCheck size={15} /> Evaluate gate
+                    </button>
+                  </div>
                 </div>
               </Panel>
-              <details>
+              <details className="legacy-deployment">
                 <summary>Legacy artifact deployment — separate workflow</summary>
                 <p>These controls deploy the legacy artifact set. They are not required after a successful Medallion deployment.</p>
               <Panel
@@ -3842,36 +3893,11 @@ export default function App() {
               </details>
             </>
           )}
-          {page === "Reconciliation" && (
+          {page === "Deployments" && (
             <Panel
-              title="2. Reconcile DEV and evaluate the gate"
+              title="DEV validation evidence"
               actions={
                 <div className="deploy-actions">
-                  <button
-                    className="primary-action"
-                    disabled={!pid || busy}
-                    onClick={runDevReconciliation}
-                  >
-                    <Gauge size={15} />
-                    Run DEV Reconciliation
-                  </button>
-                    <button
-                      disabled={!pid || busy || reconResult?.status !== "PASSED"}
-                      onClick={() =>
-                        action(async () => {
-                          const r: any = await api(
-                            `/projects/${pid}/deployments/dev/evaluate-gate`,
-                            { method: "POST" },
-                          );
-                          setGateResult(r);
-                          return r;
-                        })
-                      }
-                    >
-                      <ShieldCheck size={15} />
-                      Evaluate DEV Gate
-                    </button>
-
                   <button
                     disabled={!pid || busy || !reconResult?.run_id}
                     onClick={downloadReconciliation}
@@ -3882,15 +3908,22 @@ export default function App() {
                 </div>
               }
             >
-              <p>Run this after a successful DEV deployment. When reconciliation passes, evaluate the DEV gate, then continue to Waves for TEST promotion.</p>
+              <p className="section-caption">
+                Reconciliation evidence and the resulting DEV quality gate are
+                shown here for the current project.
+              </p>
                 {gateResult && (
                   <div className="subsection">
                     <h4>DEV quality gate</h4>
                     <pre>{JSON.stringify(gateResult, null, 2)}</pre>
                   </div>
                 )}
-              {gateResult?.status === "PASSED" && (
-                <button onClick={() => setPage("Waves")}>Next: TEST promotion</button>
+              {environmentPassed("DEV") && (
+                <div className="dev-next-action">
+                  <button className="primary-action" onClick={() => setPage("Waves")}>
+                    Continue to TEST promotion <ChevronRight size={15} />
+                  </button>
+                </div>
               )}
               <div className="notice ok">
                 Reconciliation uses the exact artifact versions from the latest
