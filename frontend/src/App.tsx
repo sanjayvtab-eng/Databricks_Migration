@@ -439,6 +439,7 @@ export default function App() {
         { method: "POST" },
       );
       setReconResult(result);
+      setGateResult(null);
       return result;
     });
   }
@@ -954,7 +955,7 @@ export default function App() {
       phase: "DEV",
       title: "Deploy and validate DEV",
       description: "Deploy Medallion DEV, run reconciliation and evaluate the DEV quality gate.",
-      page: environmentPassed("DEV") ? "Lifecycle" : reconResult?.status === "PASSED" ? "Deployments" : "Medallion Design",
+      page: environmentPassed("DEV") ? "Lifecycle" : "Deployments",
       complete: environmentPassed("DEV"),
       evidence: environmentPassed("DEV") ? "DEV quality gate passed" : "DEV deployment or validation pending",
     },
@@ -1043,11 +1044,11 @@ export default function App() {
     },
     {
       label: "VALIDATE & RESOLVE",
-      items: ["Reviews", "AI Remediation", "Issues", "Reconciliation"],
+      items: ["Reviews", "AI Remediation", "Issues"],
     },
     {
       label: "PROMOTE",
-      items: ["Deployments", "Waves", "Lifecycle"],
+      items: ["Deployments", "Reconciliation", "Waves", "Lifecycle"],
     },
     {
       label: "CLOSE",
@@ -3561,6 +3562,20 @@ export default function App() {
           )}
           {page === "Deployments" && (
             <>
+              <Panel title="1. Deploy Medallion to DEV">
+                <p>Deploy approved Bronze, Silver and Gold artifacts from Medallion Design. After the run succeeds, open Reconciliation to validate the deployed objects and evaluate the DEV gate.</p>
+                <div className="deploy-actions">
+                  <button disabled={!pid || busy} onClick={() => setPage("Medallion Design")}>
+                    <Layers3 size={15} /> Open Medallion Design to deploy
+                  </button>
+                  <button disabled={!pid || busy} onClick={() => setPage("Reconciliation")}>
+                    <ChevronRight size={15} /> Next: DEV Reconciliation and Gate
+                  </button>
+                </div>
+              </Panel>
+              <details>
+                <summary>Legacy artifact deployment — separate workflow</summary>
+                <p>These controls deploy the legacy artifact set. They are not required after a successful Medallion deployment.</p>
               <Panel
                 title="DEV deployment execution"
                 actions={
@@ -3643,38 +3658,6 @@ export default function App() {
                     >
                       <RefreshCw size={15} />
                       Resume Failed Run
-                    </button>
-                    <button
-                      disabled={!pid || busy}
-                      onClick={() =>
-                        action(async () => {
-                          const r: any = await api(
-                            `/projects/${pid}/deployments/dev/reconcile`,
-                            { method: "POST" },
-                          );
-                          setReconResult(r);
-                          return r;
-                        })
-                      }
-                    >
-                      <Gauge size={15} />
-                      Run Reconciliation
-                    </button>
-                    <button
-                      disabled={!pid || busy}
-                      onClick={() =>
-                        action(async () => {
-                          const r: any = await api(
-                            `/projects/${pid}/deployments/dev/evaluate-gate`,
-                            { method: "POST" },
-                          );
-                          setGateResult(r);
-                          return r;
-                        })
-                      }
-                    >
-                      <ShieldCheck size={15} />
-                      Evaluate DEV Gate
                     </button>
                     <button disabled={!pid || busy} onClick={viewDevLogs}>
                       <ScrollText size={15} />
@@ -3855,24 +3838,13 @@ export default function App() {
                     )}
                   </div>
                 )}
-                {reconResult && (
-                  <div className="subsection">
-                    <h4>Reconciliation</h4>
-                    <pre>{JSON.stringify(reconResult, null, 2)}</pre>
-                  </div>
-                )}
-                {gateResult && (
-                  <div className="subsection">
-                    <h4>DEV quality gate</h4>
-                    <pre>{JSON.stringify(gateResult, null, 2)}</pre>
-                  </div>
-                )}
               </Panel>
+              </details>
             </>
           )}
           {page === "Reconciliation" && (
             <Panel
-              title="DEV Medallion reconciliation"
+              title="2. Reconcile DEV and evaluate the gate"
               actions={
                 <div className="deploy-actions">
                   <button
@@ -3883,6 +3855,23 @@ export default function App() {
                     <Gauge size={15} />
                     Run DEV Reconciliation
                   </button>
+                    <button
+                      disabled={!pid || busy || reconResult?.status !== "PASSED"}
+                      onClick={() =>
+                        action(async () => {
+                          const r: any = await api(
+                            `/projects/${pid}/deployments/dev/evaluate-gate`,
+                            { method: "POST" },
+                          );
+                          setGateResult(r);
+                          return r;
+                        })
+                      }
+                    >
+                      <ShieldCheck size={15} />
+                      Evaluate DEV Gate
+                    </button>
+
                   <button
                     disabled={!pid || busy || !reconResult?.run_id}
                     onClick={downloadReconciliation}
@@ -3893,6 +3882,16 @@ export default function App() {
                 </div>
               }
             >
+              <p>Run this after a successful DEV deployment. When reconciliation passes, evaluate the DEV gate, then continue to Waves for TEST promotion.</p>
+                {gateResult && (
+                  <div className="subsection">
+                    <h4>DEV quality gate</h4>
+                    <pre>{JSON.stringify(gateResult, null, 2)}</pre>
+                  </div>
+                )}
+              {gateResult?.status === "PASSED" && (
+                <button onClick={() => setPage("Waves")}>Next: TEST promotion</button>
+              )}
               <div className="notice ok">
                 Reconciliation uses the exact artifact versions from the latest
                 successful Medallion MDR run. Tables and views use count checks;
