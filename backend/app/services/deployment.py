@@ -647,6 +647,28 @@ def _latest_successful_medallion_run(
     return None
 
 
+def medallion_deployment_status(
+    db: Session, project_id: str, environment: str = "DEV"
+) -> dict[str, Any]:
+    """Return read-only evidence for the latest complete Medallion deployment."""
+    env = environment.upper()
+    deployment = _latest_successful_medallion_run(db, project_id, env)
+    if not deployment:
+        return {
+            "environment": env,
+            "status": "NOT_STARTED",
+            "run_id": None,
+            "deployed": 0,
+        }
+    run_id, manifest = deployment
+    return {
+        "environment": env,
+        "status": "PASSED",
+        "run_id": run_id,
+        "deployed": len(manifest),
+    }
+
+
 def _routine_exists(target_fqn: str, routine_type: str) -> None:
     """Validate routine metadata without invoking business logic or causing side effects."""
     statement = (
