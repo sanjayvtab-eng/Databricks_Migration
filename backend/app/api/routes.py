@@ -10,6 +10,7 @@ from app.models.entities import *
 from app.models.canonical import MigrationDeployment, MigrationRunStep, MigrationValidation, MigrationReconciliation, MigrationReconciliationDetail
 from app.services.engine import *
 from app.services.discovery import discover_sqlserver, test_sqlserver_connection
+from app.services.source_connector import connector_info, request as connector_request
 from app.core.config import get_settings
 from app.services.databricks_client import execute_sql
 from app.services.type_compatibility import compatibility_catalog, transport_contract, transport_summary
@@ -183,14 +184,16 @@ def projects_list(db:Session=Depends(get_db),_=Depends(auth)):
 @router.get("/projects/{project_id}/sources")
 def sources_list(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     rows=db.scalars(select(MigrationSource).where(MigrationSource.project_id==project_id).order_by(MigrationSource.profile_name)).all()
-    return [{"id":x.id,"profile_name":x.profile_name,"server_name":x.server_name,"database_name":x.database_name} for x in rows]
+    return [{"id":x.id,"profile_name":x.profile_name,"server_name":x.server_name,"database_name":x.database_name,
+             "connector": connector_info(x.id)} for x in rows]
 
 @router.post("/projects/{project_id}/sources/{source_id}/test")
 def source_test(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     src=db.get(MigrationSource,source_id)
     if not src or src.project_id!=project_id: raise HTTPException(404,"Source not found in project")
     try:
-        result=test_sqlserver_connection(_sqlserver_conn_for_source(src))
+        result = (connector_request(src.id, "test") if connector_info(src.id)["mode"] == "CONNECTOR"
+                  else test_sqlserver_connection(_sqlserver_conn_for_source(src)))
         result.update({"profile_name":src.profile_name,"server_name":src.server_name,"database_name":src.database_name})
         return result
     except Exception as e:
@@ -202,7 +205,12 @@ def discovery_live(project_id:str,source_id:str,db:Session=Depends(get_db),_=Dep
     if not src or src.project_id!=project_id: raise HTTPException(404,"Source not found in project")
     conn=_sqlserver_conn_for_source(src)
     try:
-        snap=discover_sqlserver(conn)
+        if connector_info(src.id)["mode"] == "CONNECTOR":
+            connector_request(src.id, "test")
+            snap = connector_request(src.id, "discover")
+        else:
+            test_sqlserver_connection(conn)
+            snap=discover_sqlserver(conn)
         return {"counts":ingest_snapshot(db,project_id,source_id,snap),"database":snap.get("database"),"objects":len(snap.get("objects",[]))}
     except Exception as e:
         raise HTTPException(400,f"Discovery failed: {e}")

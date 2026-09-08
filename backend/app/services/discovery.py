@@ -114,6 +114,23 @@ def _driver_error_hint(message: str) -> str:
     return "Check SQL Server connectivity, credentials, ODBC driver, database access, and backend terminal logs."
 
 
+def connection_diagnostic(error: Exception) -> str:
+    """Do not forward raw driver text, connection strings or credentials to clients."""
+    message = str(error).lower()
+    if "4060" in message or "cannot open database" in message or "permission" in message:
+        return "DATABASE_ACCESS: Verify the database name and grant the connector account read and metadata permissions."
+    if "28000" in message or "login failed" in message or "18456" in message:
+        return "AUTHENTICATION_FAILED: Verify the SQL login or the Windows account running the local connector."
+    if "certificate" in message or "ssl" in message:
+        return "TLS_ERROR: Verify the SQL Server certificate and encryption settings."
+    if "im002" in message or "driver" in message and ("not found" in message or "can't open" in message):
+        return "DRIVER_MISSING: Install the configured Microsoft ODBC Driver on the machine running the connection."
+    if any(word in message for word in ("timeout", "hyt00", "08001", "network-related", "server does not exist")):
+        return ("NETWORK_UNREACHABLE: The backend could not reach SQL Server. For a local SQL Server with a hosted "
+                "backend, register and start a local connector. Otherwise verify hostname, TCP port and firewall access.")
+    return "SOURCE_OPERATION_FAILED: Check SQL Server read permissions, supported data types and connector configuration."
+
+
 def test_sqlserver_connection(connection_string: str) -> dict[str, Any]:
     try:
         import pyodbc
@@ -125,7 +142,7 @@ def test_sqlserver_connection(connection_string: str) -> dict[str, Any]:
             row = cur.execute("SELECT @@SERVERNAME AS server_name, DB_NAME() AS database_name, CAST(SERVERPROPERTY('ProductVersion') AS varchar(128)) AS product_version").fetchone()
             return {"ok": True, "server": row.server_name, "database": row.database_name, "product_version": row.product_version}
     except Exception as e:
-        raise RuntimeError(f"{e} | Recommended action: {_driver_error_hint(str(e))}") from e
+        raise RuntimeError(connection_diagnostic(e)) from e
 
 
 def discover_sqlserver(connection_string: str) -> dict[str, Any]:
@@ -224,4 +241,4 @@ def discover_sqlserver(connection_string: str) -> dict[str, Any]:
                 } for r in objs]
             }
     except Exception as e:
-        raise RuntimeError(f"{e} | Recommended action: {_driver_error_hint(str(e))}") from e
+        raise RuntimeError(connection_diagnostic(e)) from e

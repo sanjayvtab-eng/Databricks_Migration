@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
+from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import select
@@ -36,6 +37,7 @@ from app.models.canonical import (
 from app.services.databricks_client import execute_sql, databricks_connection
 from app.services.engine import compare_schema, topo_order, uid
 from app.services.discovery import test_sqlserver_connection
+from app.services.source_connector import connector_info, request as connector_request, TableStream
 from app.services.type_compatibility import (
     classify_execution_error,
     normalize_row,
@@ -383,6 +385,19 @@ def _source_connection_string(src: MigrationSource) -> str:
             "Trusted_Connection=yes;TrustServerCertificate=yes;")
 
 
+@contextmanager
+def _source_rows(src, obj, cols, sql_text, max_rows):
+    if connector_info(src.id)["mode"] == "CONNECTOR":
+        with TableStream(src.id, obj, cols, max_rows) as stream:
+            yield stream
+    else:
+        import pyodbc
+        with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql_text)
+            yield cursor
+
+
 def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mapping: MigrationMapping,
                       run_id: str, batch_size: int, max_rows: int | None, load_mode: str,
                       replace_existing_data: bool) -> dict[str, Any]:
@@ -390,6 +405,11 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
         return {"status": "SKIPPED", "rows": 0, "reason": "Not a Bronze table"}
     if load_mode.upper() not in {"FULL_LOAD", "APPEND"}:
         raise RuntimeError(f"Load mode {load_mode} requires watermark/CDC metadata not configured for this object.")
+    src = db.get(MigrationSource, obj.source_id)
+    if not src or src.project_id != project_id:
+        raise RuntimeError("Source profile not found for Bronze load")
+    if connector_info(src.id)["mode"] == "CONNECTOR":
+        connector_request(src.id, "test")
     if load_mode.upper() == "FULL_LOAD":
         existing = execute_sql(f"SELECT COUNT(*) FROM {mapping.target_fqn}", safe_retry=True)
         existing_count = int(existing[0][0]) if existing else 0
@@ -398,9 +418,6 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
         if existing_count and replace_existing_data:
             execute_sql(f"TRUNCATE TABLE {mapping.target_fqn}", safe_retry=False)
 
-    src = db.get(MigrationSource, obj.source_id)
-    if not src or src.project_id != project_id:
-        raise RuntimeError("Source profile not found for Bronze load")
     cols = db.scalars(select(MigrationColumn).where(
         MigrationColumn.project_id == project_id,
         MigrationColumn.object_id == obj.id,
@@ -413,7 +430,6 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
     # Build the source projection and target bind expressions from discovered metadata.
     # Binary/rowversion columns are transported as hexadecimal strings and reconstructed
     # with unhex(?) on Databricks so the connector can never infer ARRAY<VOID>.
-    import pyodbc
     select_cols = ",".join(source_select_expression(c) for c in cols)
     source_table = f"[{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]"
     sql_text = f"SELECT {select_cols} FROM {source_table}"
@@ -426,9 +442,8 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
     contract = transport_contract(cols)
     summary = transport_summary(cols)
     rows_loaded = 0
-    with pyodbc.connect(_source_connection_string(src), timeout=30) as source_conn, databricks_connection() as target_conn:
-        scur = source_conn.cursor(); tcur = target_conn.cursor()
-        scur.execute(sql_text)
+    with _source_rows(src, obj, cols, sql_text, max_rows) as scur, databricks_connection() as target_conn:
+        tcur = target_conn.cursor()
         while True:
             batch = scur.fetchmany(batch_size)
             if not batch:
@@ -680,6 +695,8 @@ def _routine_exists(target_fqn: str, routine_type: str) -> None:
 
 
 def _source_table_count(source: MigrationSource, obj: MigrationObject) -> int:
+    if connector_info(source.id)["mode"] == "CONNECTOR":
+        return int(connector_request(source.id, "count", {"schema": obj.schema_name, "table": obj.object_name})["count"])
     import pyodbc
     with pyodbc.connect(_source_connection_string(source), timeout=30) as conn:
         cur = conn.cursor()
@@ -801,10 +818,7 @@ def run_reconciliation(db: Session, project_id: str, environment: str = "DEV") -
                 src = db.get(MigrationSource, obj.source_id)
                 if not src:
                     raise RuntimeError("Source profile missing")
-                import pyodbc
-                with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
-                    cur = conn.cursor(); cur.execute(f"SELECT COUNT(*) FROM [{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]")
-                    source_count = int(cur.fetchone()[0])
+                source_count = _source_table_count(src, obj)
                 if source_count != target_count:
                     status = "FAILED"
         except Exception as e:

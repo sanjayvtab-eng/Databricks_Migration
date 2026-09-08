@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.core.security import hash_password
 from app.api.routes import router
+from app.api.connectors import router as connector_router
 from app.models.entities import User
 from app.models import canonical
 from app.services.engine import uid
@@ -43,6 +44,7 @@ class SecurityHeaders(BaseHTTPMiddleware):
         return response
 app.add_middleware(SecurityHeaders)
 app.include_router(router)
+app.include_router(connector_router)
 @app.get("/health", tags=["System"])
 def root_health(): return {"status":"ok","service":"migration-factory"}
 
