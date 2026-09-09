@@ -107,6 +107,89 @@ def test_prompt_limit_fails_safely_before_provider_call(monkeypatch):
         assert 'exceeding governed limit' in str(exc)
 
 
+def test_transient_provider_503_is_retried_and_then_succeeds(monkeypatch):
+    calls = {'count': 0}
+
+    class TransientClient(FakeClient):
+        def post(self, url, headers=None, json=None):
+            calls['count'] += 1
+            if calls['count'] < 3:
+                import httpx
+                request = httpx.Request('POST', url)
+                return httpx.Response(503, request=request, json={
+                    'error': {'code': 503, 'status': 'UNAVAILABLE'}
+                })
+            return super().post(url, headers=headers, json=json)
+
+    delays = []
+    monkeypatch.setattr(ai_remediation, 'get_settings', lambda: cfg())
+    monkeypatch.setattr(ai_remediation.httpx, 'Client', TransientClient)
+    monkeypatch.setattr(ai_remediation.time, 'sleep', delays.append)
+
+    payload, provider, _ = ai_remediation._call_llm('safe prompt')
+    assert provider == 'OLLAMA'
+    assert payload['conversion_strategy'] == 'TEST'
+    assert calls['count'] == 3
+    assert delays == [1.0, 2.0]
+
+
+def test_exhausted_provider_503_returns_clear_retry_message(monkeypatch):
+    class UnavailableClient(FakeClient):
+        def post(self, url, headers=None, json=None):
+            import httpx
+            request = httpx.Request('POST', url)
+            return httpx.Response(503, request=request, json={
+                'error': {'code': 503, 'message': 'temporary high demand', 'status': 'UNAVAILABLE'}
+            })
+
+    monkeypatch.setattr(ai_remediation, 'get_settings', lambda: cfg())
+    monkeypatch.setattr(ai_remediation.httpx, 'Client', UnavailableClient)
+    monkeypatch.setattr(ai_remediation.time, 'sleep', lambda _: None)
+
+    try:
+        ai_remediation._call_llm('safe prompt')
+        assert False, 'expected RuntimeError'
+    except RuntimeError as exc:
+        message = str(exc)
+        assert 'temporarily unavailable after 3 attempts' in message
+        assert 'No remediation candidate was accepted' in message
+
+
+def test_quota_429_starts_cooldown_without_duplicate_provider_calls(monkeypatch):
+    calls = {'count': 0}
+
+    class QuotaClient(FakeClient):
+        def post(self, url, headers=None, json=None):
+            calls['count'] += 1
+            import httpx
+            request = httpx.Request('POST', url)
+            return httpx.Response(429, request=request, json={
+                'error': {
+                    'code': 429,
+                    'status': 'RESOURCE_EXHAUSTED',
+                    'details': [{
+                        '@type': 'type.googleapis.com/google.rpc.RetryInfo',
+                        'retryDelay': '51s',
+                    }],
+                }
+            })
+
+    ai_remediation._PROVIDER_COOLDOWNS.clear()
+    monkeypatch.setattr(ai_remediation, 'get_settings', lambda: cfg(
+        llm_provider='GEMINI', llm_api_key='not-a-real-key', llm_model='gemini-2.5-flash'
+    ))
+    monkeypatch.setattr(ai_remediation.httpx, 'Client', QuotaClient)
+
+    for expected in ('Retry after approximately 51s', 'No provider request was sent'):
+        try:
+            ai_remediation._call_llm('safe prompt')
+            assert False, 'expected RuntimeError'
+        except RuntimeError as exc:
+            assert expected in str(exc)
+    assert calls['count'] == 1
+    ai_remediation._PROVIDER_COOLDOWNS.clear()
+
+
 def test_ai_provider_endpoints_are_authenticated_and_return_governed_shape(client, auth_headers, monkeypatch):
     from app.api import routes
     fake = {

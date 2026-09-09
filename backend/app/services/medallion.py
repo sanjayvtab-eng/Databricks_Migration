@@ -79,6 +79,32 @@ def _tokens(name: str) -> set[str]:
     return {x for x in re.split(r"[^a-z0-9]+", split.lower()) if x}
 
 
+def _semantic_input_fingerprint(
+    obj: MigrationObject,
+    columns: list[MigrationColumn],
+    primary_key: list[str],
+    foreign_keys: list[dict[str, Any]],
+    consumers: list[MigrationConsumer],
+    stats: dict[str, Any],
+) -> str:
+    """Hash only evidence that can change a table's semantic classification."""
+    payload = {
+        "source_hash": obj.source_hash,
+        "columns": [
+            [c.column_name, c.data_type, c.nullable, c.precision, c.scale]
+            for c in columns
+        ],
+        "primary_key": primary_key,
+        "foreign_keys": foreign_keys,
+        "consumer_signals": sorted({
+            (c.consumer_type, c.usage_type, c.dependency_depth, c.evidence_type)
+            for c in consumers
+        }),
+        "approx_row_count": stats.get("approx_row_count"),
+    }
+    return hashlib.sha256(_json(payload).encode()).hexdigest()
+
+
 def _catalog_from_mappings(db: Session, project_id: str, environment: str) -> str | None:
     row = db.scalars(select(MigrationMapping).where(
         MigrationMapping.project_id == project_id,
@@ -372,7 +398,16 @@ def infer_semantics(db: Session, project_id: str, *, refresh_consumers: bool = T
             "reporting_consumer_count": reporting_consumers,
             "approx_row_count": _table_stats(db, project_id, obj.id).get("approx_row_count"),
         }
-        protected = approved or explicit
+        input_fingerprint = _semantic_input_fingerprint(
+            obj, cols, pk, fks, owned_consumers, {"approx_row_count": payload["approx_row_count"]},
+        )
+        cached_ai = next((
+            row for row in existing_rows
+            if row.status == "AI_RECOMMENDED"
+            and (row.definition_source or "").startswith("AI_ASSISTED_")
+            and _loads(row.evidence_json, {}).get("input_fingerprint") == input_fingerprint
+        ), None)
+        protected = approved or explicit or cached_ai
         if protected:
             # Approved and explicit semantics are governed records regardless of
             # which inference engine created them. Preserve the canonical row and
@@ -448,6 +483,12 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
         "ai_corrected": 0,
         "ai_retry_attempts": 0,
         "ai_errors": [],
+        "ai_usage": {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cached_tokens": 0},
+        "ai_cache_hits": sum(
+            1 for item in baseline["definitions"]
+            if item["status"] == "AI_RECOMMENDED"
+            and (item.get("evidence") or {}).get("input_fingerprint")
+        ),
     })
     if not cfg.llm_enabled:
         baseline["policy"] += " AI is disabled; deterministic results were preserved."
@@ -476,6 +517,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
         fks = _foreign_keys(db, project_id, obj.id)
         stats = _table_stats(db, project_id, obj.id)
         owned_consumers = consumers_by_producer.get(obj.id, [])
+        input_fingerprint = _semantic_input_fingerprint(obj, cols, pk, fks, owned_consumers, stats)
 
         # Build structured evidence package (never includes API key or secrets).
         package = {
@@ -497,7 +539,6 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
             ],
             "primary_keys": pk,
             "foreign_keys": fks,
-            "source_definition": (obj.definition or "")[:4000],
             "deterministic_evidence": {
                 "semantic_role": item.get("role"),
                 "fact_score": item.get("evidence", {}).get("fact_score"),
@@ -505,15 +546,17 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                 # item["evidence"] is already the full evidence dict from infer_semantics
                 "evidence_signals": item.get("evidence", {}).get("evidence") or [],
             },
-            "downstream_consumers": [
+            "downstream_consumer_signals": [
                 {
-                    "consumer_name": c.consumer_name,
                     "consumer_type": c.consumer_type,
                     "usage_type": c.usage_type,
                     "dependency_depth": c.dependency_depth,
                     "evidence_type": c.evidence_type,
                 }
-                for c in owned_consumers
+                for c in {
+                    (x.consumer_type, x.usage_type, x.dependency_depth, x.evidence_type): x
+                    for x in owned_consumers
+                }.values()
             ],
             "approx_row_count": stats.get("approx_row_count"),
         }
@@ -542,6 +585,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
 
         baseline["ai_attempted"] += 1
         correction_history: list[dict[str, Any]] = []
+        object_usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
         request_prompt = prompt
         semantic_attempt_limit = min(3, max(1, cfg.llm_max_attempts))
         for semantic_attempt in range(1, semantic_attempt_limit + 1):
@@ -549,6 +593,11 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                 baseline["ai_retry_attempts"] += 1
             try:
                 raw, provider, model = call_structured_llm(request_prompt)
+                call_usage = raw.pop("_provider_usage", {}) or {}
+                for usage_key in object_usage:
+                    used = max(0, int(call_usage.get(usage_key) or 0))
+                    object_usage[usage_key] += used
+                    baseline["ai_usage"][usage_key] += used
 
                 role = str(raw.get("role") or "ENTITY").upper().strip()
                 if role not in SEMANTIC_ROLES:
@@ -655,6 +704,8 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                     "automatically_corrected": semantic_attempt > 1 or bool(safe_repairs),
                     "safe_repairs": safe_repairs,
                     "correction_history": correction_history,
+                    "input_fingerprint": input_fingerprint,
+                    "provider_usage": object_usage,
                 })
                 baseline["ai_recommended"] += 1
                 if semantic_attempt > 1 or safe_repairs:
@@ -681,7 +732,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                     + "\nDo not use friendly labels, derived names, table names, spaces not present in the list, "
                       "or any other column. Correct structural omissions too. Return the complete corrected JSON only.\n"
                     + "Previous response:\n"
-                    + json.dumps(raw, default=str)[:12000]
+                    + json.dumps(raw, separators=(",", ":"), default=str)[:4000]
                 )
             except Exception as exc:
                 safe_err = _sanitize_error(exc)
@@ -698,6 +749,7 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
     baseline["policy"] = (
         "Hybrid V2.2 validates, safely repairs, revalidates, then delivers recommendations with deterministic fallback. "
         "Unknown optional attributes are removed with evidence; invalid keys, grain, measures or structures receive up to two correction attempts. "
+        "Unchanged AI recommendations are reused by evidence fingerprint without another provider call. "
         "AI results are AI_RECOMMENDED and never auto-approved or auto-deployed."
     )
     return baseline

@@ -62,6 +62,11 @@ NON_REMEDIABLE_ISSUE_TYPES = {
 RUNTIME_DETERMINISTIC_CATEGORIES = {"LOAD"}
 RUNTIME_AI_ELIGIBLE_CATEGORIES = {"CONVERSION", "DATABRICKS_SYNTAX", "MAPPING", "SOURCE_SEMANTIC", "UNRESOLVED_COLUMN"}
 
+# A quota response applies to the provider/model, not just one artifact. Keep a
+# short process-local cooldown so repeated clicks and multi-object loops do not
+# spend more requests while the provider has explicitly asked us to wait.
+_PROVIDER_COOLDOWNS: dict[str, float] = {}
+
 FORBIDDEN_SQL = (
     "DROP CATALOG",
     "DROP DATABASE",
@@ -500,6 +505,16 @@ def _context(db: Session, project_id: str, o: MigrationObject, environment: str)
             MigrationMapping.project_id == project_id, MigrationMapping.environment == environment.upper()
         )
     ).all()
+    dependency_names = {
+        (str(d.referenced_schema or "").lower(), str(d.referenced_object or "").lower())
+        for d in dependencies
+    }
+    required_mappings = []
+    for mapping in mappings:
+        source_parts = [part.strip("[]`").lower() for part in mapping.source_fqn.split(".")]
+        source_pair = tuple(source_parts[-2:]) if len(source_parts) >= 2 else ("", source_parts[-1] if source_parts else "")
+        if mapping.object_id == o.id or source_pair in dependency_names:
+            required_mappings.append(mapping)
     return {
         "current_artifact": current.content if current else None,
         "current_artifact_version_id": current.id if current else None,
@@ -519,7 +534,7 @@ def _context(db: Session, project_id: str, o: MigrationObject, environment: str)
             }
             for d in dependencies
         ],
-        "available_mappings": [{"source": x.source_fqn, "target": x.target_fqn} for x in mappings],
+        "available_mappings": [{"source": x.source_fqn, "target": x.target_fqn} for x in required_mappings],
     }
 
 
@@ -559,12 +574,11 @@ def _build_prompt(
         "available_mappings": context["available_mappings"],
         "current_artifact": context["current_artifact"],
         "latest_validation": context["validation"],
-        "latest_review": context["review"],
         "previous_candidate_errors": prior_errors or [],
     }
     return f"""You are the governed remediation engine for a SQL Server to Databricks migration factory.
 Return one JSON object only. It must conform to this shape:
-{json.dumps(contract, indent=2)}
+{json.dumps(contract, separators=(",", ":"))}
 
 Non-negotiable controls:
 - Preserve the supplied source business logic. Never invent a column, object, rule, KPI or default.
@@ -576,7 +590,7 @@ Non-negotiable controls:
 - Confidence must be between 0 and 1. State every material assumption and an evidence-based validation plan.
 
 Object metadata:
-{json.dumps(metadata, indent=2, default=str)}
+{json.dumps(metadata, separators=(",", ":"), default=str)}
 
 Source definition (authoritative):
 {o.definition or ''}
@@ -600,6 +614,54 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
+def _provider_usage(body: dict[str, Any], provider: str) -> dict[str, int]:
+    """Normalize provider token accounting without storing response content."""
+    if provider == "GEMINI":
+        raw = body.get("usageMetadata") or {}
+        values = {
+            "prompt_tokens": raw.get("promptTokenCount"),
+            "output_tokens": raw.get("candidatesTokenCount"),
+            "total_tokens": raw.get("totalTokenCount"),
+            "cached_tokens": raw.get("cachedContentTokenCount"),
+        }
+    else:
+        raw = body.get("usage") or {}
+        values = {
+            "prompt_tokens": raw.get("prompt_tokens"),
+            "output_tokens": raw.get("completion_tokens"),
+            "total_tokens": raw.get("total_tokens"),
+            "cached_tokens": raw.get("cached_tokens"),
+        }
+    normalized: dict[str, int] = {}
+    for key, value in values.items():
+        try:
+            normalized[key] = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            normalized[key] = 0
+    return normalized
+
+
+def _quota_retry_after(response: httpx.Response | None) -> float:
+    """Extract a provider retry delay without exposing response credentials."""
+    if response is None:
+        return 60.0
+    header = response.headers.get("Retry-After", "")
+    try:
+        return min(300.0, max(1.0, float(header)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        details = ((response.json() or {}).get("error") or {}).get("details") or []
+        for detail in details:
+            value = str((detail or {}).get("retryDelay") or "").strip().lower()
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", value)
+            if match:
+                return min(300.0, max(1.0, float(match.group(1))))
+    except Exception:
+        pass
+    return 60.0
+
+
 def _call_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
     cfg = get_settings()
     if not cfg.llm_enabled:
@@ -611,6 +673,13 @@ def _call_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
         raise RuntimeError(
             f"AI remediation prompt is {len(prompt):,} characters, exceeding governed limit "
             f"LLM_MAX_PROMPT_CHARS={cfg.llm_max_prompt_chars:,}. Split/redesign the object or increase the governed limit."
+        )
+    cooldown_key = f"{provider}:{cfg.llm_model}"
+    cooldown_remaining = _PROVIDER_COOLDOWNS.get(cooldown_key, 0.0) - time.time()
+    if cooldown_remaining > 0:
+        raise RuntimeError(
+            f"{provider} quota cooldown is active for approximately {int(cooldown_remaining) + 1}s. "
+            "No provider request was sent; retry after the cooldown."
         )
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if provider == "OLLAMA":
@@ -670,11 +739,33 @@ def _call_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
     def _safe_msg(msg: str) -> str:
         return msg.replace(_api_key, "***") if _api_key else msg
 
+    transient_statuses = {429, 500, 502, 503, 504}
+    transport_attempts = min(3, max(1, cfg.llm_max_attempts))
     try:
         with httpx.Client(timeout=cfg.llm_timeout_seconds, trust_env=trust_env) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            body = response.json()
+            for transport_attempt in range(1, transport_attempts + 1):
+                try:
+                    response = client.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    body = response.json()
+                    break
+                except httpx.HTTPStatusError as exc:
+                    status_code = exc.response.status_code if exc.response is not None else None
+                    if status_code == 429:
+                        retry_after = _quota_retry_after(exc.response)
+                        _PROVIDER_COOLDOWNS[cooldown_key] = time.time() + retry_after
+                        raise RuntimeError(
+                            f"{provider} quota/rate limit reached (HTTP 429). Retry after approximately "
+                            f"{int(retry_after)}s. No additional provider retries were attempted."
+                        ) from exc
+                    if status_code not in transient_statuses or transport_attempt >= transport_attempts:
+                        raise
+                    retry_after = exc.response.headers.get("Retry-After", "") if exc.response is not None else ""
+                    try:
+                        delay = min(5.0, max(0.0, float(retry_after)))
+                    except (TypeError, ValueError):
+                        delay = min(4.0, float(2 ** (transport_attempt - 1)))
+                    time.sleep(delay)
     except httpx.ConnectError as exc:
         if provider == "OLLAMA":
             raise RuntimeError(
@@ -685,10 +776,16 @@ def _call_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
         raise RuntimeError(f"AI provider timed out after {cfg.llm_timeout_seconds}s; no candidate was accepted.") from exc
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:1000] if exc.response is not None else str(exc)
+        status_code = exc.response.status_code if exc.response is not None else None
         # Never include the raw URL (which contains no key now, but sanitize defensively).
         safe_detail = _safe_msg(detail)
         if provider == "OLLAMA" and exc.response is not None and exc.response.status_code == 404:
             raise RuntimeError(f"Ollama model or endpoint was not found. Verify LLM_MODEL={cfg.llm_model!r}. Provider response: {safe_detail}") from exc
+        if status_code in transient_statuses:
+            raise RuntimeError(
+                f"{provider} is temporarily unavailable after {transport_attempts} attempts "
+                f"(HTTP {status_code}). No remediation candidate was accepted. Retry the repair shortly."
+            ) from exc
         raise RuntimeError(f"AI provider request failed safely. Provider response: {safe_detail}") from exc
     except httpx.HTTPError as exc:
         raise RuntimeError(_safe_msg(f"AI provider request failed safely: {exc}")) from exc
@@ -704,7 +801,9 @@ def _call_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
             content = str(body["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("AI provider returned an unsupported response shape") from exc
-    return _extract_json(content), provider, cfg.llm_model
+    parsed = _extract_json(content)
+    parsed["_provider_usage"] = _provider_usage(body, provider)
+    return parsed, provider, cfg.llm_model
 
 
 def call_structured_llm(prompt: str) -> tuple[dict[str, Any], str, str]:
@@ -732,6 +831,7 @@ def _normalized_result(
         "validation_plan": [str(x) for x in (raw.get("validation_plan") or [])],
         "provider": provider,
         "model": model,
+        "provider_usage": raw.get("_provider_usage") or {},
         "deterministic_validation": validation,
     }
 
@@ -773,7 +873,10 @@ def analyze_remediation(
             raw, provider, model = _call_llm(prompt)
             result = _normalized_result(raw, o, m, issue, provider, model)
             errors = list(result["deterministic_validation"].get("errors") or [])
-            attempts.append({"attempt": attempt, "provider": provider, "valid": not errors, "errors": errors})
+            attempts.append({
+                "attempt": attempt, "provider": provider, "valid": not errors,
+                "errors": errors, "usage": result.get("provider_usage") or {},
+            })
             prompt_row.status = "VALIDATED" if not errors else "RETRY_REQUIRED"
             if not errors:
                 break
@@ -783,6 +886,10 @@ def analyze_remediation(
         raise RuntimeError("No deterministic remediation pattern matched and AI fallback was not requested.")
 
     result["attempts"] = attempts
+    result["provider_usage_total"] = {
+        key: sum(int((row.get("usage") or {}).get(key) or 0) for row in attempts)
+        for key in ("prompt_tokens", "output_tokens", "total_tokens", "cached_tokens")
+    }
     ai_run = MigrationAiRun(
         id=uid("AIR"), project_id=project_id, object_id=o.id, environment=environment.upper(),
         status="VALIDATED" if result["deterministic_validation"].get("valid") else "REVIEW_REQUIRED",

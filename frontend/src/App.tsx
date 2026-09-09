@@ -2025,6 +2025,10 @@ export default function App() {
                       <b>{semanticRun.ai_attempted ?? 0}</b>
                     </div>
                     <div className="summary-stat">
+                      <span>Cached results reused</span>
+                      <b>{semanticRun.ai_cache_hits ?? 0}</b>
+                    </div>
+                    <div className="summary-stat">
                       <span>Auto-corrected</span>
                       <b>{semanticRun.ai_corrected ?? 0}</b>
                     </div>
@@ -2044,13 +2048,18 @@ export default function App() {
                       <span>AI errors</span>
                       <b>{semanticRun.ai_errors?.length || 0}</b>
                     </div>
+                    <div className="summary-stat">
+                      <span>Gemini tokens used</span>
+                      <b>{semanticRun.ai_usage?.total_tokens ?? 0}</b>
+                    </div>
                   </div>
-                  {semanticRun.ai_attempted === 0 && (
+                  {semanticRun.ai_attempted === 0 &&
+                    (semanticRun.ai_cache_hits ?? 0) === 0 && (
                     <div className="notice">
                       No AI call was attempted. Verify that AI is enabled and
                       that at least one semantic row is REVIEW_REQUIRED.
                     </div>
-                  )}
+                    )}
                   {semanticRun.ai_errors?.length > 0 && (
                     <details>
                       <summary>View sanitized AI errors</summary>

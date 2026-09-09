@@ -578,6 +578,18 @@ def test_t16_invalid_column_is_automatically_corrected(client, auth_headers):
     }]
     assert body["ai_recommended"] >= 1
 
+    def must_not_repeat_ai(*args, **kwargs):
+        raise AssertionError("Unchanged AI semantic recommendation must be reused")
+
+    with patch("app.services.medallion.call_structured_llm", must_not_repeat_ai):
+        cached = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+    assert cached.status_code == 200
+    cached_body = cached.json()
+    assert cached_body["ai_attempted"] == 0
+    assert cached_body["ai_cache_hits"] == 1
+    cached_semantic = next(d for d in cached_body["definitions"] if "AmbigCorrection" in d["object_name"])
+    assert cached_semantic["status"] == "AI_RECOMMENDED"
+
 
 def test_t17_critical_measure_column_requires_ai_correction(client, auth_headers):
     objects = [{"schema": "dbo", "name": "AmbigCritical", "type": "TABLE",
