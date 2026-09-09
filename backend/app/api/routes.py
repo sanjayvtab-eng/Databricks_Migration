@@ -25,7 +25,8 @@ from app.services.deployment import (
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
     upsert_explicit_semantic, approve_semantic, build_medallion_plan, medallion_plan,
-    generate_medallion_artifacts, list_medallion_artifacts, review_medallion_artifact, deploy_medallion_dev,
+    generate_medallion_artifacts, list_medallion_artifacts, review_medallion_artifact,
+    remediate_medallion_artifact, deploy_medallion_dev,
 )
 from app.services.ai_remediation import (
     accept_remediation,
@@ -644,6 +645,15 @@ def medallion_artifact_review_api(project_id:str,version_id:str,data:MedallionRe
         row=review_medallion_artifact(db,project_id,version_id,status=data.status,reviewer=data.reviewer)
         return {"artifact_version_id":row.id,"review_status":row.review_status,"reviewer":row.reviewer,"reviewed_at":row.reviewed_at}
     except ValueError as e: raise HTTPException(400,str(e))
+
+@router.post("/projects/{project_id}/medallion/artifacts/{version_id}/remediate")
+def medallion_artifact_remediate_api(project_id:str,version_id:str,data:RemediationOneIn,db:Session=Depends(get_db),user=Depends(auth)):
+    try:
+        return remediate_medallion_artifact(
+            db,project_id,version_id,environment=data.environment,use_ai=data.use_ai,
+            reviewer=getattr(user,"username",None) or data.reviewer,
+        )
+    except (ValueError,RuntimeError) as e: raise HTTPException(400,str(e))
 
 @router.post("/projects/{project_id}/medallion/deploy-dev")
 def medallion_deploy_api(project_id:str,data:MedallionDeployIn,db:Session=Depends(get_db),_=Depends(auth)):
