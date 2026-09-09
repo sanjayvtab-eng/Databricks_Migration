@@ -46,7 +46,9 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
     } finally { setBusy(false); }
   };
   const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
-  const command = `python scripts/local_connector.py --url ${quote(window.location.origin)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)}`;
+  const isSqlExpress = source.server_name.toUpperCase().includes("\\SQLEXPRESS");
+  const certificateOption = isSqlExpress ? " --trust-server-certificate" : "";
+  const command = `python scripts/local_connector.py --url ${quote(window.location.origin)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)} --driver ${quote("ODBC Driver 18 for SQL Server")}${certificateOption}`;
 
   return <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
     <span>{status === "DIRECT" ? "Direct connection" : `Connector: ${status.toLowerCase()}`}</span>
@@ -62,7 +64,8 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
           <p>Registration token is shown once. Enter it at the connector's password prompt.</p>
           <textarea aria-label="Registration token" readOnly value={registration.token} rows={3} style={{ width: "100%", boxSizing: "border-box" }} />
           <p>From the updated repository folder on the SQL Server machine:</p>
-          <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pip install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
+          <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pi install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
+          {isSqlExpress && <p><strong>Certificate setting:</strong> This SQL Express command trusts its local/self-signed certificate while keeping transport encryption enabled.</p>}
           <p>Windows Authentication uses the account running this command. For SQL Authentication add <code>--username 'your-sql-login'</code>; the password is prompted locally.</p>
           <p>Keep the connector running. When its status becomes online, close this panel and select Test. See <code>docs/LOCAL_CONNECTOR.md</code> for certificate setup and recovery.</p>
         </> : <p>Registration switches this source to connector mode. Registering again invalidates the previous token and cancels pending connector tasks.</p>}
