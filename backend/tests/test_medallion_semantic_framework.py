@@ -176,13 +176,14 @@ def test_failed_medallion_routine_repair_creates_new_validated_unapproved_versio
         engine_service, 'static_validate',
         lambda *args, **kwargs: {'valid':False, 'status':'FAILED', 'issues':['seed failure']},
     )
-    monkeypatch.setattr(
-        ai_remediation, 'remediate_one_artifact',
-        lambda *args, **kwargs: {
+    repair_call = {}
+    def fake_repair(*args, **kwargs):
+        repair_call.update(kwargs)
+        return {
             'status':'READY_FOR_REVIEW', 'artifact_version_id':candidate.id,
             'artifact_version':candidate.version, 'ai_run_id':'AIR_test', 'provider':'GEMINI',
-        },
-    )
+        }
+    monkeypatch.setattr(ai_remediation, 'remediate_one_artifact', fake_repair)
 
     response = client.post(
         f'/api/projects/{pid}/medallion/artifacts/{failed.id}/remediate',
@@ -195,6 +196,7 @@ def test_failed_medallion_routine_repair_creates_new_validated_unapproved_versio
     assert body['validation_status'] == 'PASSED'
     assert body['review_status'] == 'PENDING_REVIEW'
     assert body['auto_approved'] is False and body['auto_deployed'] is False
+    assert repair_call['confirmed_blocker'] == f'MEDALLION_STAGE_VALIDATION:{failed.id}'
 
     repaired = db.get(MigrationStageArtifactVersion, body['artifact_version_id'])
     assert repaired.version == failed.version + 1

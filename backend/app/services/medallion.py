@@ -1432,6 +1432,7 @@ def remediate_medallion_artifact(
     static_validate(db, project_id, obj.id, env)
     repaired = remediate_one_artifact(
         db, project_id, obj.id, environment=env, use_ai=use_ai, reviewer=reviewer,
+        confirmed_blocker=f"MEDALLION_STAGE_VALIDATION:{version.id}",
     )
     if repaired.get("status") != "READY_FOR_REVIEW":
         errors = repaired.get("errors") or repaired.get("static_validation", {}).get("issues") or []

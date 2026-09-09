@@ -82,6 +82,29 @@ def test_single_artifact_repair_creates_validated_unapproved_version(db):
     )) is None
 
 
+def test_confirmed_medallion_blocker_runs_repair_when_legacy_projection_has_no_blocker(db):
+    p,obj=_seed(db)
+    art=db.scalar(select(MigrationArtifact).where(
+        MigrationArtifact.project_id==p.id,MigrationArtifact.object_id==obj.id
+    ))
+    current=db.scalar(select(MigrationArtifactVersion).where(
+        MigrationArtifactVersion.artifact_id==art.id,
+        MigrationArtifactVersion.version==art.current_version,
+    ))
+    current.content='CREATE OR REPLACE FUNCTION `migration_dev`.`silver`.`fn_OrderTotal`(`OrderID` INT) RETURNS DECIMAL(18,2) LANGUAGE SQL RETURN 0;'
+    db.commit()
+    assert not remediation_plan(db,p.id,'DEV')['items']
+
+    result=remediate_one_artifact(
+        db,p.id,obj.id,environment='DEV',use_ai=False,reviewer='architect',
+        confirmed_blocker='MEDALLION_STAGE_VALIDATION:MSV_test',
+    )
+    assert result['status']=='READY_FOR_REVIEW'
+    assert result['artifact_version']==2
+    assert result['auto_approved'] is False
+    assert result['auto_deployed'] is False
+
+
 def test_medallion_regeneration_uses_latest_approved_repaired_routine(db):
     p,obj=_seed(db)
     build_medallion_plan(db,p.id,environment='DEV',catalog='migration_dev')

@@ -1031,8 +1031,15 @@ def remediate_one_artifact(
     environment: str = "DEV",
     use_ai: bool = True,
     reviewer: str = "system",
+    confirmed_blocker: str | None = None,
 ) -> dict[str, Any]:
-    """Create and statically validate one new artifact version without approving it."""
+    """Create and statically validate one new artifact version without approving it.
+
+    ``confirmed_blocker`` is reserved for another governed validation workflow
+    (currently Medallion stage validation) that has already proved the current
+    source object is blocked.  It prevents that workflow from being discarded
+    merely because the legacy artifact projection happens to be executable.
+    """
     env = environment.upper()
     if env != "DEV":
         raise ValueError("Artifact remediation is currently restricted to DEV")
@@ -1043,7 +1050,14 @@ def remediate_one_artifact(
     plan = remediation_plan(db, project_id, env)
     item = next((row for row in plan["items"] if row["object_id"] == object_id), None)
     if not item:
-        raise ValueError("The current artifact version has no remediation blocker")
+        if not confirmed_blocker:
+            raise ValueError("The current artifact version has no remediation blocker")
+        issue = _latest_issue(db, project_id, object_id)
+        route, issue_eligible, _ = _issue_route(issue)
+        item = {
+            "eligible": obj.object_type != "TRIGGER" and issue_eligible,
+            "route": "ARCHITECT_REVIEW" if obj.object_type == "TRIGGER" else (route or "DETERMINISTIC_THEN_AI"),
+        }
     if not item["eligible"]:
         raise ValueError(f"Artifact requires {item['route']} and cannot be repaired automatically")
     if item.get("route") == "COMPATIBILITY_ENGINE":
