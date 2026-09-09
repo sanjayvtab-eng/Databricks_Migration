@@ -332,6 +332,11 @@ export default function App() {
         setConsumers(cs);
         setMedArts(ma);
       }
+      if (page === "Reviews" && id) {
+        setMedArts(
+          await api(`/projects/${id}/medallion/artifacts?environment=DEV`),
+        );
+      }
       if (page === "AI Remediation" && id) {
         const [plan, provider]: any = await Promise.all([
           api(`/projects/${id}/remediation/plan?environment=DEV`),
@@ -749,6 +754,32 @@ export default function App() {
       const r = await api(
         `/projects/${pid}/medallion/artifacts/${versionId}/review`,
         { method: "POST", body: JSON.stringify({ status, reviewer: "admin" }) },
+      );
+      setMedArts(
+        await api(`/projects/${pid}/medallion/artifacts?environment=DEV`),
+      );
+      return r;
+    });
+  }
+  async function remediateMedArtifact(versionId: string) {
+    if (!pid) return;
+    if (
+      !confirm(
+        "Run the governed repair loop for this failed DEV artifact? A successful repair creates a new validated version but will not approve or deploy it.",
+      )
+    )
+      return;
+    await action(async () => {
+      const r: any = await api(
+        `/projects/${pid}/medallion/artifacts/${versionId}/remediate`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            environment: "DEV",
+            use_ai: true,
+            reviewer: "admin",
+          }),
+        },
       );
       setMedArts(
         await api(`/projects/${pid}/medallion/artifacts?environment=DEV`),
@@ -2252,7 +2283,17 @@ export default function App() {
                   <Empty text="Analyze consumers to build direct and transitive downstream usage evidence." />
                 )}
               </Panel>
-              <Panel title="Generated Medallion artifacts">
+              <Panel
+                title="Generated Medallion artifacts"
+                actions={
+                  medArts.length ? (
+                    <button onClick={() => setPage("Reviews")}>
+                      <ClipboardCheck size={15} />
+                      Review and resolve artifacts
+                    </button>
+                  ) : null
+                }
+              >
                 {medArts.length ? (
                   <table>
                     <thead>
@@ -2285,17 +2326,9 @@ export default function App() {
                           <td>v{x.version}</td>
                           <td>
                             <div className="table-actions">
-                              {x.review_status !== "APPROVED" &&
-                                x.executable &&
-                                x.validation_status === "PASSED" && (
-                                  <button
-                                    onClick={() =>
-                                      reviewMedArtifact(x.artifact_version_id)
-                                    }
-                                  >
-                                    Approve
-                                  </button>
-                                )}
+                              <button onClick={() => setPage("Reviews")}>
+                                Open governed review
+                              </button>
                               <details>
                                 <summary>SQL</summary>
                                 <pre>{x.content}</pre>
@@ -3147,8 +3180,145 @@ export default function App() {
             </>
           )}
           {page === "Reviews" && (
-            <Panel title="Artifact reviews">
-              {artifacts.length ? (
+            <Panel title="Governed Medallion artifact reviews">
+              {medArts.length ? (
+                <>
+                  <div className="ai-guardrail">
+                    <ShieldCheck size={22} />
+                    <div>
+                      <b>Review the exact versions that will be deployed to DEV</b>
+                      <span>
+                        Passed artifacts require a human decision. Failed routine
+                        artifacts must complete the governed repair loop before
+                        approval becomes available.
+                      </span>
+                    </div>
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Layer</th>
+                        <th>Target</th>
+                        <th>Version</th>
+                        <th>Validation</th>
+                        <th>Review status</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {medArts.map((a: any) => {
+                        const valid =
+                          a.executable && a.validation_status === "PASSED";
+                        const repairable =
+                          !valid &&
+                          ["PROCEDURE", "FUNCTION"].includes(
+                            a.source_object_type,
+                          );
+                        return (
+                          <tr key={a.artifact_version_id}>
+                            <td>
+                              <Badge s={a.layer} />
+                            </td>
+                            <td>
+                              <code>{a.target_fqn}</code>
+                            </td>
+                            <td>v{a.version}</td>
+                            <td>
+                              <Badge s={a.validation_status} />
+                            </td>
+                            <td>
+                              <Badge s={a.review_status} />
+                            </td>
+                            <td>
+                              <div className="review-actions">
+                                {valid && a.review_status !== "APPROVED" && (
+                                  <button
+                                    className="primary-action"
+                                    disabled={busy}
+                                    title="Approve this validated version for DEV deployment"
+                                    onClick={() =>
+                                      reviewMedArtifact(
+                                        a.artifact_version_id,
+                                        "APPROVED",
+                                      )
+                                    }
+                                  >
+                                    <CheckCircle2 size={14} />
+                                    Approve for DEV
+                                  </button>
+                                )}
+                                {valid && a.review_status !== "REJECTED" && (
+                                  <button
+                                    disabled={busy}
+                                    onClick={() => {
+                                      if (
+                                        confirm(
+                                          `Reject ${a.target_fqn} v${a.version}?`,
+                                        )
+                                      )
+                                        reviewMedArtifact(
+                                          a.artifact_version_id,
+                                          "REJECTED",
+                                        );
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                )}
+                                {valid &&
+                                  a.review_status !== "CHANGES_REQUIRED" && (
+                                    <button
+                                      disabled={busy}
+                                      onClick={() =>
+                                        reviewMedArtifact(
+                                          a.artifact_version_id,
+                                          "CHANGES_REQUIRED",
+                                        )
+                                      }
+                                    >
+                                      Request changes
+                                    </button>
+                                  )}
+                                {repairable && (
+                                  <button
+                                    className="primary-action"
+                                    disabled={busy}
+                                    title="Create a corrected, statically validated version for human review"
+                                    onClick={() =>
+                                      remediateMedArtifact(a.artifact_version_id)
+                                    }
+                                  >
+                                    <Sparkles size={14} />
+                                    Repair with {aiProvider?.provider || "AI"}
+                                  </button>
+                                )}
+                                {!valid && !repairable && (
+                                  <button
+                                    disabled={busy}
+                                    onClick={() => setPage("AI Remediation")}
+                                  >
+                                    Open remediation guidance
+                                  </button>
+                                )}
+                                <details>
+                                  <summary>View SQL and evidence</summary>
+                                  <pre>{a.content}</pre>
+                                  {!valid && (
+                                    <div className="review-block-reason">
+                                      {(a.validation?.errors || []).join("; ") ||
+                                        "Static validation must pass before approval."}
+                                    </div>
+                                  )}
+                                </details>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </>
+              ) : artifacts.length ? (
                 <table>
                   <thead>
                     <tr>
@@ -3323,9 +3493,9 @@ export default function App() {
                   </tbody>
                 </table>
               ) : (
-                <Empty text="Generate artifacts before review." />
+                <Empty text="Build the Medallion plan and generate DEV artifacts before review." />
               )}
-              {reviews.length > 0 && (
+              {!medArts.length && reviews.length > 0 && (
                 <div className="subsection">
                   <h4>Review history</h4>
                   <table>
