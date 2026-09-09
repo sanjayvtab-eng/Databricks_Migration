@@ -1316,6 +1316,7 @@ def list_medallion_artifacts(db: Session, project_id: str, *, environment: str =
     for art in arts:
         node = nodes.get(art.node_id)
         if not node: continue
+        source_obj = db.get(MigrationObject, node.source_object_id) if node.source_object_id else None
         version = db.scalar(select(MigrationStageArtifactVersion).where(
             MigrationStageArtifactVersion.project_id == project_id,
             MigrationStageArtifactVersion.artifact_id == art.id,
@@ -1325,6 +1326,8 @@ def list_medallion_artifacts(db: Session, project_id: str, *, environment: str =
         result.append({
             "artifact_id": art.id, "artifact_version_id": version.id, "node_id": node.id,
             "layer": node.layer, "node_type": node.node_type, "model_role": node.model_role,
+            "source_object_id": node.source_object_id,
+            "source_object_type": source_obj.object_type if source_obj else None,
             "target_fqn": node.target_fqn, "version": version.version, "content": version.content,
             "executable": version.executable, "validation_status": version.validation_status,
             "validation": _loads(version.validation_json, {}), "review_status": version.review_status,
@@ -1337,13 +1340,137 @@ def review_medallion_artifact(db: Session, project_id: str, version_id: str, *, 
     version = db.get(MigrationStageArtifactVersion, version_id)
     if not version or version.project_id != project_id:
         raise ValueError("Medallion artifact version not found in project")
+    artifact = db.get(MigrationStageArtifact, version.artifact_id)
+    if not artifact or artifact.project_id != project_id or artifact.current_version != version.version:
+        raise ValueError("Only the current Medallion artifact version can receive a review decision")
     state = status.upper().strip()
     if state not in {"APPROVED", "REJECTED", "CHANGES_REQUIRED"}:
         raise ValueError("status must be APPROVED, REJECTED or CHANGES_REQUIRED")
     if state == "APPROVED" and (not version.executable or version.validation_status != "PASSED"):
         raise ValueError("Approval blocked: artifact must be executable and validation must PASSED")
-    version.review_status = state; version.reviewer = reviewer; version.reviewed_at = datetime.utcnow(); db.commit()
+    version.review_status = state; version.reviewer = reviewer; version.reviewed_at = datetime.utcnow()
+
+    # A repaired Medallion routine is derived from a governed source-object
+    # candidate. Mirror the human approval to that exact source version so a
+    # later idempotent regeneration continues to use the approved repair.
+    if state == "APPROVED":
+        source_version_id = _loads(version.validation_json, {}).get("source_artifact_version_id")
+        source_version = db.get(MigrationArtifactVersion, source_version_id) if source_version_id else None
+        if source_version and source_version.project_id == project_id:
+            latest = db.scalars(select(MigrationReview).where(
+                MigrationReview.project_id == project_id,
+                MigrationReview.artifact_version_id == source_version.id,
+                MigrationReview.review_type == "ARCHITECT_REVIEW",
+            ).order_by(MigrationReview.reviewed_at.desc())).first()
+            if not latest or latest.status != "APPROVED":
+                db.add(MigrationReview(
+                    id=uid("REV"), project_id=project_id,
+                    artifact_version_id=source_version.id,
+                    review_type="ARCHITECT_REVIEW", status="APPROVED",
+                    reviewer=reviewer,
+                    comments=f"Approved through Medallion artifact {version.id}",
+                ))
+    db.commit()
     return version
+
+
+def remediate_medallion_artifact(
+    db: Session,
+    project_id: str,
+    version_id: str,
+    *,
+    environment: str = "DEV",
+    use_ai: bool = True,
+    reviewer: str = "system",
+) -> dict[str, Any]:
+    """Repair one failed routine and publish a new Medallion version for review.
+
+    The existing remediation engine operates on source-object artifacts. This bridge
+    deliberately reuses that governed engine, then copies only a successfully
+    statically-validated candidate into a new Medallion stage version. It never
+    approves or deploys the candidate.
+    """
+    from app.services.ai_remediation import remediate_one_artifact
+    from app.services.engine import generate_artifact, static_validate
+
+    env = environment.upper()
+    if env != "DEV":
+        raise ValueError("Medallion artifact remediation is currently restricted to DEV")
+    version = db.get(MigrationStageArtifactVersion, version_id)
+    if not version or version.project_id != project_id:
+        raise ValueError("Medallion artifact version not found in project")
+    artifact = db.get(MigrationStageArtifact, version.artifact_id)
+    if not artifact or artifact.project_id != project_id or artifact.current_version != version.version:
+        raise ValueError("Only the current Medallion artifact version can be remediated")
+    if version.executable and version.validation_status == "PASSED":
+        raise ValueError("Artifact already passed validation and is ready for human review")
+
+    node = db.get(MigrationMedallionNode, version.node_id)
+    obj = db.get(MigrationObject, node.source_object_id) if node and node.source_object_id else None
+    if not node or node.project_id != project_id or not obj or obj.project_id != project_id:
+        raise ValueError("Failed Medallion artifact has no source object for remediation")
+    if obj.object_type not in {"PROCEDURE", "FUNCTION"}:
+        raise ValueError(f"{obj.object_type} artifact requires manual architecture review")
+
+    mapping = db.scalar(select(MigrationMapping).where(
+        MigrationMapping.project_id == project_id,
+        MigrationMapping.object_id == obj.id,
+        MigrationMapping.environment == env,
+    ))
+    if not mapping:
+        mapping = MigrationMapping(
+            id=uid("MAP"), project_id=project_id, object_id=obj.id,
+            source_fqn=f"{obj.database_name}.{obj.schema_name}.{obj.object_name}",
+            target_fqn=node.target_fqn, target_layer=node.layer, environment=env,
+        )
+        db.add(mapping)
+        db.commit()
+
+    # Seed the source-object repair loop with the same deterministic conversion
+    # that failed Medallion generation, including version-specific validation.
+    generate_artifact(db, project_id, obj.id, env)
+    static_validate(db, project_id, obj.id, env)
+    repaired = remediate_one_artifact(
+        db, project_id, obj.id, environment=env, use_ai=use_ai, reviewer=reviewer,
+    )
+    if repaired.get("status") != "READY_FOR_REVIEW":
+        errors = repaired.get("errors") or repaired.get("static_validation", {}).get("issues") or []
+        raise ValueError("AI remediation did not produce a valid candidate: " + "; ".join(errors))
+
+    source_version = db.get(MigrationArtifactVersion, repaired["artifact_version_id"])
+    if not source_version or source_version.project_id != project_id:
+        raise ValueError("Validated remediation candidate was not found")
+    content = _retarget_repaired_routine(source_version.content, obj.object_type, node.target_fqn)
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    new_version = MigrationStageArtifactVersion(
+        id=uid("MSV"), project_id=project_id, artifact_id=artifact.id, node_id=node.id,
+        version=artifact.current_version + 1, content=content, content_hash=content_hash,
+        executable=True, validation_status="PASSED",
+        validation_json=_json({
+            "errors": [], "node_id": node.id, "target_fqn": node.target_fqn,
+            "source_artifact_version_id": source_version.id,
+            "source_artifact_version": source_version.version,
+            "source_artifact_hash": source_version.target_hash,
+            "ai_run_id": repaired.get("ai_run_id"),
+            "provider": repaired.get("provider"),
+            "validation_type": "GOVERNED_AI_REMEDIATION",
+        }),
+        review_status="PENDING_REVIEW",
+    )
+    db.add(new_version)
+    artifact.current_version = new_version.version
+    node.status = "ARTIFACT_READY"
+    db.commit()
+    return {
+        "artifact_version_id": new_version.id,
+        "version": new_version.version,
+        "status": "READY_FOR_REVIEW",
+        "validation_status": new_version.validation_status,
+        "review_status": new_version.review_status,
+        "provider": repaired.get("provider"),
+        "auto_approved": False,
+        "auto_deployed": False,
+    }
 
 
 def _layer_order(layer: str) -> int:
