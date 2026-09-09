@@ -1411,6 +1411,7 @@ def generate_medallion_artifacts(db: Session, project_id: str, *, environment: s
         source_version = None
         source_obj = db.get(MigrationObject, node.source_object_id) if node.source_object_id else None
         if source_obj and source_obj.object_type in {"PROCEDURE", "FUNCTION"}:
+            content = normalize_databricks_routine_contract(content, source_obj.object_type)
             contract_errors = databricks_routine_contract_issues(content, source_obj.object_type)
             if contract_errors:
                 executable = False

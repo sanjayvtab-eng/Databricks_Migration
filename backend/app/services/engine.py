@@ -14,17 +14,33 @@ def qident(v: str) -> str: return "`" + v.replace("`","``") + "`"
 
 def normalize_databricks_routine_contract(content: str, object_type: str) -> str:
     """Apply safe, deterministic Databricks clauses without changing routine logic."""
-    if object_type.upper() != "PROCEDURE":
+    kind = object_type.upper()
+    if kind == "PROCEDURE":
+        if not re.search(r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROCEDURE\b", content):
+            return content
+        if re.search(r"(?is)\bSQL\s+SECURITY\s+(?:INVOKER|DEFINER)\b", content):
+            return content
+        language = re.search(r"(?is)\bLANGUAGE\s+SQL\b", content)
+        if not language:
+            return content
+        remainder = content[language.end():].lstrip()
+        return content[:language.end()] + "\nSQL SECURITY INVOKER\n" + remainder
+
+    if kind == "FUNCTION":
+        if not re.search(r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?FUNCTION\b", content):
+            return content
+        reads_data = bool(re.search(r"(?is)\b(?:FROM|JOIN)\b", content))
+        has_contains = bool(re.search(r"(?is)\bCONTAINS\s+SQL\b", content))
+        has_reads = bool(re.search(r"(?is)\bREADS\s+SQL\s+DATA\b", content))
+
+        if reads_data and has_contains:
+            if has_reads:
+                content = re.sub(r"(?is)\bCONTAINS\s+SQL\s*\n?", "", content)
+            else:
+                content = re.sub(r"(?is)\bCONTAINS\s+SQL\b", "READS SQL DATA", content)
         return content
-    if not re.search(r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROCEDURE\b", content):
-        return content
-    if re.search(r"(?is)\bSQL\s+SECURITY\s+(?:INVOKER|DEFINER)\b", content):
-        return content
-    language = re.search(r"(?is)\bLANGUAGE\s+SQL\b", content)
-    if not language:
-        return content
-    remainder = content[language.end():].lstrip()
-    return content[:language.end()] + "\nSQL SECURITY INVOKER\n" + remainder
+
+    return content
 
 
 def databricks_routine_contract_issues(content: str, object_type: str) -> list[str]:
@@ -45,6 +61,19 @@ def databricks_routine_contract_issues(content: str, object_type: str) -> list[s
             issues.append("Databricks procedure is missing SQL SECURITY INVOKER")
         elif language and security.start() < language.end():
             issues.append("Databricks procedure SQL SECURITY clause must follow LANGUAGE SQL")
+    elif kind == "FUNCTION":
+        has_contains = bool(re.search(r"(?is)\bCONTAINS\s+SQL\b", content))
+        has_reads = bool(re.search(r"(?is)\bREADS\s+SQL\s+DATA\b", content))
+        reads_data = bool(re.search(r"(?is)\b(?:FROM|JOIN)\b", content))
+        if has_contains and reads_data:
+            issues.append(
+                "Databricks SQL function that accesses a table/view cannot specify CONTAINS SQL; use READS SQL DATA instead"
+            )
+        if has_contains and has_reads:
+            issues.append("Databricks SQL function cannot specify both CONTAINS SQL and READS SQL DATA")
+        data_clause = re.search(r"(?is)\b(?:CONTAINS\s+SQL|READS\s+SQL\s+DATA)\b", content)
+        if data_clause and language and data_clause.start() < language.end():
+            issues.append("Databricks function data access clause must follow LANGUAGE SQL")
     return issues
 
 
@@ -235,7 +264,9 @@ def _convert_function(db: Session, project_id: str, o: MigrationObject, m: Migra
         mm=re.search(r"\bRETURN\s*\((.*)\)\s*;?\s*$",_clean_routine_body(rewritten),flags=re.I|re.S)
         query=(mm.group(1).strip() if mm else "")
         if query and re.match(r"(?is)^\s*(SELECT|WITH)\b",query):
-            return (f"CREATE OR REPLACE FUNCTION {m.target_fqn}({sig})\nRETURNS TABLE\nLANGUAGE SQL\nRETURN ({query.rstrip(';')});",True,"INLINE_TVF_TO_SQL_TABLE_FUNCTION")
+            content = f"CREATE OR REPLACE FUNCTION {m.target_fqn}({sig})\nRETURNS TABLE\nLANGUAGE SQL\nRETURN ({query.rstrip(';')});"
+            content = normalize_databricks_routine_contract(content, "FUNCTION")
+            return (content,True,"INLINE_TVF_TO_SQL_TABLE_FUNCTION")
 
     # Scalar function with deterministic RETURN expression/query.
     ret_type_match=re.search(r"\bRETURNS\s+([\[\]\w]+)(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?",definition,flags=re.I)
@@ -249,7 +280,9 @@ def _convert_function(db: Session, project_id: str, o: MigrationObject, m: Migra
     # Avoid auto-converting multi-statement/stateful UDFs.
     complex_tokens=("declare "," set ","while ","cursor ","insert ","update ","delete ","merge ","raiserror","throw ")
     if expr and not any(tok in body.lower() for tok in complex_tokens):
-        return (f"CREATE OR REPLACE FUNCTION {m.target_fqn}({sig})\nRETURNS {ret_type}\nLANGUAGE SQL\nRETURN {expr.rstrip(';')};",True,"SCALAR_UDF_TO_SQL_FUNCTION")
+        content = f"CREATE OR REPLACE FUNCTION {m.target_fqn}({sig})\nRETURNS {ret_type}\nLANGUAGE SQL\nRETURN {expr.rstrip(';')};"
+        content = normalize_databricks_routine_contract(content, "FUNCTION")
+        return (content,True,"SCALAR_UDF_TO_SQL_FUNCTION")
 
     reason=f"{ft} requires semantic/manual remediation before executable deployment ({target})."
     return (f"-- FUNCTION_CLASSIFICATION: {ft}\n-- RECOMMENDED_TARGET: {target}\n-- NON_EXECUTABLE: {reason}\n"+rewritten,False,reason)

@@ -589,6 +589,8 @@ Non-negotiable controls:
 - Use the configured target FQN exactly for the object being created.
 - Replace source references only with a supplied project/environment mapping.
 - Generate an executable DEV candidate, not commentary, Markdown or deployment claims.
+- For Databricks SQL functions: use CREATE OR REPLACE FUNCTION and LANGUAGE SQL. If the function queries tables or views (via FROM or JOIN), specify READS SQL DATA after LANGUAGE SQL; never use CONTAINS SQL when querying tables or views.
+- For Databricks procedures: use CREATE OR REPLACE PROCEDURE, LANGUAGE SQL, and SQL SECURITY INVOKER.
 - Never emit DROP, TRUNCATE, DELETE, catalog/schema changes, secrets, approval, or production actions.
 - If semantics cannot be preserved safely, return generated_candidate as an empty string and explain the blocker in risks.
 - Confidence must be between 0 and 1. State every material assumption and an evidence-based validation plan.

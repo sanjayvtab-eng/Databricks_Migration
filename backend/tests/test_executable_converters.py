@@ -91,3 +91,41 @@ def test_precheck_deduplicates_blockers(db):
     keys=[(x['code'],x['message']) for x in r['blockers']]
     assert len(keys)==len(set(keys))
     assert not any(x['code']=='NON_EXECUTABLE_ARTIFACT' for x in r['blockers'])
+
+
+def test_ai_function_candidate_replaces_contains_sql_with_reads_sql_data(db):
+    from app.services.ai_remediation import validate_candidate_content
+    from app.services.engine import databricks_routine_contract_issues
+    from app.models.entities import MigrationMapping
+
+    p = _seed_routines(db)
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'fn_OrderTotal',
+    ))
+    mapping = db.scalar(select(MigrationMapping).where(
+        MigrationMapping.project_id == p.id,
+        MigrationMapping.object_id == obj.id,
+        MigrationMapping.environment == 'DEV',
+    ))
+    # Unnormalized candidate with CONTAINS SQL querying a table
+    raw_candidate = (
+        f'CREATE OR REPLACE FUNCTION {mapping.target_fqn}(OrderID INT)\n'
+        'RETURNS DECIMAL(18,2)\n'
+        'LANGUAGE SQL\n'
+        'CONTAINS SQL\n'
+        'RETURN (\n'
+        f'  SELECT COALESCE(SUM(Amount), CAST(0 AS DECIMAL(18,2)))\n'
+        f'  FROM `migration_dev`.`bronze`.`Orders` AS t\n'
+        '  WHERE t.OrderId = OrderID\n'
+        ');'
+    )
+    # Raw issues should flag CONTAINS SQL on a table-reading function
+    issues = databricks_routine_contract_issues(raw_candidate, 'FUNCTION')
+    assert any('READS SQL DATA' in x for x in issues)
+
+    # Validation should normalize CONTAINS SQL to READS SQL DATA
+    result = validate_candidate_content(obj, mapping, raw_candidate)
+    assert result['valid'] is True
+    assert 'READS SQL DATA' in result['normalized_candidate']
+    assert 'CONTAINS SQL' not in result['normalized_candidate']
