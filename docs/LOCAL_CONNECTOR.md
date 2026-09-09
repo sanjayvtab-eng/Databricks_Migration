@@ -23,10 +23,10 @@ ephemeral database. No SQL Server firewall port needs to be opened to Render.
 6. For Windows Authentication, run under a Windows account with SQL Server access.
    For SQL Authentication, append `--username 'your-sql-login'` and enter its password
    at the hidden prompt. Never put database passwords in the hosted source profile.
-7. The SQL connection uses encryption and certificate validation. Install a trusted
-   SQL Server certificate. For your controlled local SQL Express test instance with a
-   self-signed certificate, explicitly add `--trust-server-certificate` (SQL transport
-   remains encrypted, but server certificate identity is not verified).
+7. The SQL connection uses ODBC Driver 18 with encryption. For a SQL Express instance,
+   the Sources dialog automatically adds `--trust-server-certificate` so a controlled
+   local/self-signed certificate can be used while transport remains encrypted. For a
+   production SQL Server, install a trusted certificate and do not use this option.
 8. Leave the process running. Connector status refreshes every 15 seconds.
 9. Once ONLINE, click Test, then run Discovery. Discovery tests the source again before
    capturing metadata. Review artifacts, deploy DEV, reconcile, and evaluate the gate
