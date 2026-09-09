@@ -118,6 +118,102 @@ def test_routines_are_planned_as_logic_assets(client,auth_headers):
     assert proc['transformation']['intent']=='ETL_LOAD'
     assert func['node_type'] in {'SQL_FUNCTION','FUNCTION_PLAN'}
 
+
+def test_failed_medallion_routine_repair_creates_new_validated_unapproved_version(
+    client, auth_headers, db, monkeypatch
+):
+    from app.models.entities import (
+        MigrationArtifact,
+        MigrationArtifactVersion,
+        MigrationMedallionNode,
+        MigrationObject,
+        MigrationReview,
+        MigrationStageArtifact,
+        MigrationStageArtifactVersion,
+    )
+    from app.services.engine import uid
+    import app.services.ai_remediation as ai_remediation
+    import app.services.engine as engine_service
+
+    pid = _project_with_semantics(client, auth_headers)
+    client.post(
+        f'/api/projects/{pid}/medallion/plan', headers=auth_headers,
+        json={'environment':'DEV','catalog':'migration_dev'},
+    )
+    assert client.post(
+        f'/api/projects/{pid}/medallion/generate?environment=DEV', headers=auth_headers,
+    ).status_code == 200
+
+    node = db.query(MigrationMedallionNode).filter_by(
+        project_id=pid, environment='DEV', target_name='usp_LoadSales', layer='SILVER'
+    ).one()
+    stage_artifact = db.query(MigrationStageArtifact).filter_by(
+        project_id=pid, node_id=node.id
+    ).one()
+    failed = db.query(MigrationStageArtifactVersion).filter_by(
+        project_id=pid, artifact_id=stage_artifact.id,
+        version=stage_artifact.current_version,
+    ).one()
+    failed.executable = False
+    failed.validation_status = 'FAILED'
+    failed.validation_json = '{"errors":["unsupported procedure"]}'
+
+    obj = db.get(MigrationObject, node.source_object_id)
+    legacy_artifact = MigrationArtifact(
+        id=uid('ART'), project_id=pid, object_id=obj.id,
+        artifact_type=obj.object_type, current_version=1,
+    )
+    candidate = MigrationArtifactVersion(
+        id=uid('ARV'), project_id=pid, artifact_id=legacy_artifact.id, version=1,
+        content='CREATE OR REPLACE PROCEDURE placeholder() LANGUAGE SQL AS BEGIN SELECT 1; END;',
+        source_hash='source', target_hash='target', generator_version='test', rule_version='test',
+    )
+    db.add_all([legacy_artifact, candidate])
+    db.commit()
+
+    monkeypatch.setattr(engine_service, 'generate_artifact', lambda *args, **kwargs: candidate)
+    monkeypatch.setattr(
+        engine_service, 'static_validate',
+        lambda *args, **kwargs: {'valid':False, 'status':'FAILED', 'issues':['seed failure']},
+    )
+    monkeypatch.setattr(
+        ai_remediation, 'remediate_one_artifact',
+        lambda *args, **kwargs: {
+            'status':'READY_FOR_REVIEW', 'artifact_version_id':candidate.id,
+            'artifact_version':candidate.version, 'ai_run_id':'AIR_test', 'provider':'GEMINI',
+        },
+    )
+
+    response = client.post(
+        f'/api/projects/{pid}/medallion/artifacts/{failed.id}/remediate',
+        headers=auth_headers,
+        json={'environment':'DEV','use_ai':True,'reviewer':'architect'},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['status'] == 'READY_FOR_REVIEW'
+    assert body['validation_status'] == 'PASSED'
+    assert body['review_status'] == 'PENDING_REVIEW'
+    assert body['auto_approved'] is False and body['auto_deployed'] is False
+
+    repaired = db.get(MigrationStageArtifactVersion, body['artifact_version_id'])
+    assert repaired.version == failed.version + 1
+    assert repaired.content.startswith(f'CREATE OR REPLACE PROCEDURE {node.target_fqn}')
+    db.expire_all()
+    assert db.get(MigrationStageArtifact, stage_artifact.id).current_version == repaired.version
+
+    approved = client.post(
+        f'/api/projects/{pid}/medallion/artifacts/{repaired.id}/review',
+        headers=auth_headers,
+        json={'status':'APPROVED','reviewer':'architect'},
+    )
+    assert approved.status_code == 200, approved.text
+    mirrored = db.query(MigrationReview).filter_by(
+        project_id=pid, artifact_version_id=candidate.id,
+        review_type='ARCHITECT_REVIEW', status='APPROVED',
+    ).one()
+    assert mirrored.reviewer == 'architect'
+
 def test_medallion_dev_deployment_is_review_gated_and_layer_ordered(client,auth_headers,db,monkeypatch):
     from app.services.medallion import deploy_medallion_dev
     from app.models.entities import MigrationStageArtifactVersion
