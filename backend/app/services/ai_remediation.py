@@ -30,6 +30,8 @@ from .engine import (
     _replace_known_references,
     _replace_parameters,
     _routine_parameters,
+    databricks_routine_contract_issues,
+    normalize_databricks_routine_contract,
     sha,
     static_validate,
     uid,
@@ -386,6 +388,7 @@ def _strip_markdown_fence(candidate: str) -> str:
 
 def validate_candidate_content(o: MigrationObject, m: MigrationMapping, candidate: str) -> dict[str, Any]:
     candidate = _strip_markdown_fence(candidate)
+    candidate = normalize_databricks_routine_contract(candidate, o.object_type)
     errors: list[str] = []
     warnings: list[str] = []
     upper = candidate.upper()
@@ -421,6 +424,7 @@ def validate_candidate_content(o: MigrationObject, m: MigrationMapping, candidat
         errors.append("Candidate contains no recognizable executable SQL")
     if o.object_type == "TRIGGER":
         errors.append("Triggers require architectural redesign and cannot be auto-applied")
+    errors.extend(databricks_routine_contract_issues(candidate, o.object_type))
     if not errors and re.search(r"(?i)\bTODO\b|<[^>]+>", candidate):
         warnings.append("Candidate may contain a placeholder requiring review")
     return {"valid": not errors, "errors": errors, "warnings": warnings, "normalized_candidate": candidate}

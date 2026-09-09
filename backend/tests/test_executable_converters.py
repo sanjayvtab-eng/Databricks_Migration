@@ -27,12 +27,57 @@ def test_function_and_procedure_generate_executable_artifacts(db):
     assert '`migration_dev`.`bronze`.`Orders`' in fn.content
     assert 'CREATE OR REPLACE PROCEDURE' in sp.content
     assert 'LANGUAGE SQL' in sp.content
+    assert 'SQL SECURITY INVOKER' in sp.content
     assert '-- NON_EXECUTABLE:' not in sp.content
 
     orchestration=generate_artifact(db,p.id,objs['usp_DailySalesETL'].id)
     assert 'CALL `migration_dev`.`silver`.`usp_GetCustomerOrders`();' in orchestration.content
+    assert 'SQL SECURITY INVOKER' in orchestration.content
     assert 'EXEC ' not in orchestration.content.upper()
     assert '-- NON_EXECUTABLE:' not in orchestration.content
+
+
+def test_static_validation_rejects_procedure_missing_databricks_security_clause(db):
+    from app.services.engine import static_validate
+
+    p = _seed_routines(db)
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'usp_GetCustomerOrders',
+    ))
+    version = generate_artifact(db, p.id, obj.id)
+    version.content = version.content.replace('\nSQL SECURITY INVOKER', '')
+    version.target_hash = 'missing-security-clause'
+    db.commit()
+
+    result = static_validate(db, p.id, obj.id, 'DEV')
+    assert result['status'] == 'FAILED'
+    assert result['artifact_version_id'] == version.id
+    assert any('SQL SECURITY INVOKER' in issue for issue in result['issues'])
+
+
+def test_ai_procedure_candidate_gets_safe_security_clause_before_acceptance(db):
+    from app.services.ai_remediation import validate_candidate_content
+    from app.models.entities import MigrationMapping
+
+    p = _seed_routines(db)
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'usp_GetCustomerOrders',
+    ))
+    mapping = db.scalar(select(MigrationMapping).where(
+        MigrationMapping.project_id == p.id,
+        MigrationMapping.object_id == obj.id,
+        MigrationMapping.environment == 'DEV',
+    ))
+    candidate = (
+        f'CREATE OR REPLACE PROCEDURE {mapping.target_fqn}()\n'
+        'LANGUAGE SQL\nAS BEGIN\nSELECT 1;\nEND;'
+    )
+
+    result = validate_candidate_content(obj, mapping, candidate)
+    assert result['valid'] is True
+    assert 'LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN' in result['normalized_candidate']
 
 
 def test_precheck_deduplicates_blockers(db):

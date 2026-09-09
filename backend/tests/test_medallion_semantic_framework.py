@@ -201,6 +201,7 @@ def test_failed_medallion_routine_repair_creates_new_validated_unapproved_versio
     repaired = db.get(MigrationStageArtifactVersion, body['artifact_version_id'])
     assert repaired.version == failed.version + 1
     assert repaired.content.startswith(f'CREATE OR REPLACE PROCEDURE {node.target_fqn}')
+    assert 'LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN' in repaired.content
     db.expire_all()
     assert db.get(MigrationStageArtifact, stage_artifact.id).current_version == repaired.version
 
@@ -264,6 +265,40 @@ def test_medallion_dev_deployment_is_review_gated_and_layer_ordered(client,auth_
     assert download.status_code==200
     assert 'text/csv' in download.headers['content-type']
     assert 'target_fqn' in download.text
+
+
+def test_medallion_deployment_preflight_rejects_approved_procedure_missing_security_clause(
+    client, auth_headers, db
+):
+    from app.services.medallion import deploy_medallion_dev
+    from app.models.entities import MigrationStageArtifactVersion
+
+    pid = _project_with_semantics(client, auth_headers)
+    client.post(
+        f'/api/projects/{pid}/medallion/plan', headers=auth_headers,
+        json={'environment':'DEV','catalog':'migration_dev'},
+    )
+    generated = client.post(
+        f'/api/projects/{pid}/medallion/generate?environment=DEV', headers=auth_headers,
+    )
+    assert generated.status_code == 200, generated.text
+
+    versions = db.query(MigrationStageArtifactVersion).filter_by(project_id=pid).all()
+    for version in versions:
+        if version.executable and version.validation_status == 'PASSED':
+            version.review_status = 'APPROVED'
+            version.reviewer = 'architect'
+    procedure = next(version for version in versions if 'CREATE OR REPLACE PROCEDURE' in version.content)
+    procedure.content = procedure.content.replace('\nSQL SECURITY INVOKER', '')
+    db.commit()
+
+    try:
+        deploy_medallion_dev(db, pid)
+        assert False, 'expected Databricks routine preflight blocker'
+    except ValueError as exc:
+        message = str(exc)
+        assert 'routine preflight' in message
+        assert 'SQL SECURITY INVOKER' in message
 
 
 def test_reconciliation_uses_exact_medallion_manifest_and_type_aware_checks(client,auth_headers,db,monkeypatch):

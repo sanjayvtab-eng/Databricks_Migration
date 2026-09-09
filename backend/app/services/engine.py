@@ -12,6 +12,42 @@ def sha(text: str) -> str: return hashlib.sha256(text.encode()).hexdigest()
 def qident(v: str) -> str: return "`" + v.replace("`","``") + "`"
 
 
+def normalize_databricks_routine_contract(content: str, object_type: str) -> str:
+    """Apply safe, deterministic Databricks clauses without changing routine logic."""
+    if object_type.upper() != "PROCEDURE":
+        return content
+    if not re.search(r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROCEDURE\b", content):
+        return content
+    if re.search(r"(?is)\bSQL\s+SECURITY\s+(?:INVOKER|DEFINER)\b", content):
+        return content
+    language = re.search(r"(?is)\bLANGUAGE\s+SQL\b", content)
+    if not language:
+        return content
+    remainder = content[language.end():].lstrip()
+    return content[:language.end()] + "\nSQL SECURITY INVOKER\n" + remainder
+
+
+def databricks_routine_contract_issues(content: str, object_type: str) -> list[str]:
+    """Validate target-runtime clauses that local source checks cannot discover."""
+    kind = object_type.upper()
+    if kind not in {"PROCEDURE", "FUNCTION"}:
+        return []
+    issues: list[str] = []
+    header = re.search(rf"(?is)\bCREATE\s+OR\s+REPLACE\s+{kind}\b", content)
+    language = re.search(r"(?is)\bLANGUAGE\s+SQL\b", content)
+    if not header:
+        issues.append(f"Databricks {kind.lower()} must use CREATE OR REPLACE {kind}")
+    if not language:
+        issues.append(f"Databricks {kind.lower()} is missing LANGUAGE SQL")
+    if kind == "PROCEDURE":
+        security = re.search(r"(?is)\bSQL\s+SECURITY\s+(?:INVOKER|DEFINER)\b", content)
+        if not security:
+            issues.append("Databricks procedure is missing SQL SECURITY INVOKER")
+        elif language and security.start() < language.end():
+            issues.append("Databricks procedure SQL SECURITY clause must follow LANGUAGE SQL")
+    return issues
+
+
 def _retarget_view_header(content: str, target_fqn: str) -> str:
     """Make a discovered view definition idempotent and target the governed DEV FQN.
 
@@ -246,6 +282,7 @@ def _convert_procedure(db: Session, project_id: str, o: MigrationObject, m: Migr
     if body:
         content=(f"CREATE OR REPLACE PROCEDURE {m.target_fqn}({sig})\n"
                  f"LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN\n{body.rstrip(';')};\nEND;")
+        content = normalize_databricks_routine_contract(content, "PROCEDURE")
         return (content,True,f"{intent}_TO_DATABRICKS_SQL_PROCEDURE")
     reason="Procedure body could not be parsed safely."
     return (f"-- PROCEDURE_CLASSIFICATION: {intent}\n-- NON_EXECUTABLE: {reason}\n"+definition,False,reason)
@@ -311,8 +348,10 @@ def static_validate(db: Session, project_id: str, object_id: str, environment: s
         ))
     if not av:
         issues.append("No current artifact version exists for static validation")
-    elif "-- NON_EXECUTABLE:" in av.content.upper() or "ARCHITECT_REVIEW_REQUIRED" in av.content.upper():
-        issues.append("Current artifact is not executable and requires remediation before approval")
+    else:
+        if "-- NON_EXECUTABLE:" in av.content.upper() or "ARCHITECT_REVIEW_REQUIRED" in av.content.upper():
+            issues.append("Current artifact is not executable and requires remediation before approval")
+        issues.extend(databricks_routine_contract_issues(av.content, o.object_type))
 
     status="PASSED" if not issues else "FAILED"
     db.add(MigrationValidation(

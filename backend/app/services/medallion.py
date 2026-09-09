@@ -32,6 +32,8 @@ from app.services.engine import (
     _convert_function,
     _convert_procedure,
     _retarget_view_header,
+    databricks_routine_contract_issues,
+    normalize_databricks_routine_contract,
     qident,
     rewrite_common_tsql,
     uid,
@@ -1298,7 +1300,8 @@ def _retarget_repaired_routine(content: str, object_type: str, target_fqn: str) 
     kind = "FUNCTION" if object_type == "FUNCTION" else "PROCEDURE"
     pattern = rf"(?is)^\s*CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?{kind}\s+[^\s(]+"
     replacement = f"CREATE OR REPLACE {kind} {target_fqn}"
-    return re.sub(pattern, lambda _: replacement, content, count=1)
+    retargeted = re.sub(pattern, lambda _: replacement, content, count=1)
+    return normalize_databricks_routine_contract(retargeted, object_type)
 
 
 def generate_medallion_artifacts(db: Session, project_id: str, *, environment: str = "DEV") -> dict[str, Any]:
@@ -1315,6 +1318,11 @@ def generate_medallion_artifacts(db: Session, project_id: str, *, environment: s
         content, executable, errors = _stage_content(db, project_id, node, env)
         source_version = None
         source_obj = db.get(MigrationObject, node.source_object_id) if node.source_object_id else None
+        if source_obj and source_obj.object_type in {"PROCEDURE", "FUNCTION"}:
+            contract_errors = databricks_routine_contract_issues(content, source_obj.object_type)
+            if contract_errors:
+                executable = False
+                errors = list(dict.fromkeys([*errors, *contract_errors]))
         if node.layer == "SILVER" and source_obj and source_obj.object_type in {"PROCEDURE", "FUNCTION"}:
             source_version = _approved_repaired_artifact(db, project_id, source_obj.id, env)
         validation = "PASSED" if executable and not errors else "FAILED"
@@ -1494,6 +1502,9 @@ def remediate_medallion_artifact(
     if not source_version or source_version.project_id != project_id:
         raise ValueError("Validated remediation candidate was not found")
     content = _retarget_repaired_routine(source_version.content, obj.object_type, node.target_fqn)
+    contract_errors = databricks_routine_contract_issues(content, obj.object_type)
+    if contract_errors:
+        raise ValueError("Remediation candidate failed Databricks routine validation: " + "; ".join(contract_errors))
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     new_version = MigrationStageArtifactVersion(
         id=uid("MSV"), project_id=project_id, artifact_id=artifact.id, node_id=node.id,
@@ -1553,6 +1564,19 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
     blockers = [x for x in artifacts if x["review_status"] != "APPROVED" or x["validation_status"] != "PASSED" or not x["executable"]]
     if blockers:
         raise ValueError(f"Medallion deployment blocked: {len(blockers)} artifact(s) are not approved/executable/validated")
+
+    runtime_contract_blockers = []
+    for item in artifacts:
+        issues = databricks_routine_contract_issues(
+            item["content"], item.get("source_object_type") or item.get("node_type") or ""
+        )
+        if issues:
+            runtime_contract_blockers.append(f"{item['target_fqn']}: {'; '.join(issues)}")
+    if runtime_contract_blockers:
+        raise ValueError(
+            "Medallion deployment blocked by Databricks routine preflight. Regenerate and review the corrected "
+            "artifact version: " + " | ".join(runtime_contract_blockers)
+        )
 
     node_by_id = {n.id: n for n in db.scalars(select(MigrationMedallionNode).where(
         MigrationMedallionNode.project_id == project_id,
