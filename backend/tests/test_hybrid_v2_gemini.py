@@ -656,3 +656,71 @@ def test_t18_approved_ai_semantic_does_not_create_deterministic_duplicate(client
     assert definitions[0]["id"] == candidate["id"]
     assert definitions[0]["status"] == "APPROVED"
     assert definitions[0]["definition_source"] == "AI_ASSISTED_HYBRID_V2_2"
+
+
+# Test 20: Direct semantic approval with role override and bulk approvals
+def test_t20_direct_semantic_approval_with_role_override_and_bulk_approvals(client, auth_headers):
+    objects = [
+        {"schema": "dbo", "name": "CustomerSales", "type": "TABLE",
+         "columns": [_col("CustomerID", "int", False), _col("OrderCount", "int", True), _col("TotalSales", "decimal", True, 18, 2)],
+         "constraints": [_pk("PK_CS", ["CustomerID"])]},
+        {"schema": "dbo", "name": "Customers", "type": "TABLE",
+         "columns": [_col("CustomerID", "int", False), _col("CustomerName", "nvarchar")],
+         "constraints": [_pk("PK_C", ["CustomerID"])]},
+        {"schema": "dbo", "name": "ReportingFeed", "type": "TABLE",
+         "columns": [_col("FeedId", "int", False), _col("CustomerID", "int", False)],
+         "constraints": [_pk("PK_RF", ["FeedId"]), _fk("FK_RF_CS", ["CustomerID"], "dbo", "CustomerSales", ["CustomerID"])]},
+    ]
+    pid = _create_project(client, auth_headers, "T20 Approvals", "DB20", objects)
+
+    # Initially run infer with AI returning ENTITY
+    entity_resp = {"role": "ENTITY", "confidence": 0.60, "grain": [], "business_keys": ["CustomerID"],
+                   "dimension_keys": [], "attributes": [], "measures": [], "reasoning_summary": "Ambiguous",
+                   "conflicts": [], "missing_evidence": []}
+    with patch("app.services.medallion.call_structured_llm", return_value=(entity_resp, "GEMINI", "g")):
+        first = client.post(f"/api/projects/{pid}/semantics/infer", headers=auth_headers)
+    assert first.status_code == 200
+
+    defs = {d["object_name"]: d for d in first.json()["definitions"]}
+    cs = defs["dbo.CustomerSales"]
+    assert cs["status"] == "REVIEW_REQUIRED"
+
+    # Direct resolve and approve as AGGREGATE
+    res = client.post(
+        f"/api/projects/{pid}/semantics/{cs['id']}/approve",
+        headers=auth_headers,
+        json={"actor": "engineer", "role": "AGGREGATE"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "APPROVED"
+    assert body["semantic_role"] == "AGGREGATE"
+
+    # Bulk approve remaining semantics
+    bulk_sem = client.post(
+        f"/api/projects/{pid}/semantics/approve-all",
+        headers=auth_headers,
+        json={"actor": "lead"},
+    )
+    assert bulk_sem.status_code == 200
+    assert bulk_sem.json()["approved_count"] >= 1
+
+    # Plan and generate medallion
+    plan = client.post(
+        f"/api/projects/{pid}/medallion/plan",
+        headers=auth_headers,
+        json={"environment": "DEV", "catalog": "migration_dev"},
+    )
+    assert plan.status_code == 200
+
+    gen = client.post(f"/api/projects/{pid}/medallion/generate?environment=DEV", headers=auth_headers)
+    assert gen.status_code == 200
+
+    # Bulk approve medallion artifacts
+    bulk_art = client.post(
+        f"/api/projects/{pid}/medallion/artifacts/approve-all?environment=DEV",
+        headers=auth_headers,
+        json={"reviewer": "deployer"},
+    )
+    assert bulk_art.status_code == 200
+    assert bulk_art.json()["approved_count"] > 0

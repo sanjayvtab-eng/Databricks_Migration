@@ -570,12 +570,12 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
             "  role, confidence (0.0–1.0), grain, business_keys, dimension_keys, attributes,\n"
             "  measures [{name, source_column, aggregation}], reasoning_summary, conflicts, missing_evidence.\n\n"
             "Classification rules (classify from evidence, not from the object name alone):\n"
-            "- FACT: has transaction grain, date columns, FK references to dimensions, additive measures.\n"
-            "- DIMENSION: has a stable business key, descriptive attributes, referenced by other tables.\n"
-            "- AGGREGATE: has GROUP BY / aggregation evidence in its definition or definition, no row-level grain.\n"
+            "- FACT: transaction-level or periodic event table with additive measures and grain (transaction key, business key, or date).\n"
+            "- DIMENSION: master data, entity, or reference table with a stable business key and descriptive attributes, referenced by other tables.\n"
+            "- AGGREGATE: pre-aggregated summary table or view containing grouped metrics/measures (e.g. Total*, Count*, Amount*, Quantity*) grouped by dimension/business keys (e.g. CustomerID), or with GROUP BY aggregation evidence.\n"
             "- KPI: derived metric aggregation with business KPI semantics.\n"
             "- REPORTING: pre-built summary or reporting view without standard fact/dim semantics.\n"
-            "- ENTITY: when evidence is insufficient or conflicting; do not guess.\n\n"
+            "- ENTITY: base relational entity only when the table is not an aggregate, fact, or dimension.\n\n"
             "Structural requirements (reject if not met):\n"
             "- FACT: grain and measures are both required.\n"
             "- DIMENSION: business_keys is required.\n"
@@ -610,9 +610,16 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
             # Correction 3: Strict column validation per object.
             # Any invented column raises ValueError → falls back to REVIEW_REQUIRED for this
             # object and continues processing the remaining objects (not a total failure).
-                def _resolve_col(value: str) -> str:
+                def _clean_token(v: Any) -> str:
+                    s = str(v or "").strip()
+                    return re.sub(r"^[`'\"\[]+|[`'\"\]]+$", "", s).strip()
+
+                def _resolve_col(value: str) -> str | None:
                     """Resolve a column name against discovered columns; raise on invented names."""
-                    resolved = names.get(str(value).strip().lower())
+                    token = _clean_token(value)
+                    if not token or token.lower() in {"none", "n/a", "null", "-", "no grain", "no key", "no business keys"}:
+                        return None
+                    resolved = names.get(token.lower())
                     if resolved is None:
                         raise ValueError(
                             f"AI returned column {value!r} which does not exist in the discovered "
@@ -627,12 +634,15 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                     return [val]
 
                 safe_repairs: list[dict[str, Any]] = []
-                grain = [_resolve_col(v) for v in _as_list(raw.get("grain"))]
-                business_keys = [_resolve_col(v) for v in _as_list(raw.get("business_keys"))]
-                dimension_keys = [_resolve_col(v) for v in _as_list(raw.get("dimension_keys"))]
+                grain = [col for v in _as_list(raw.get("grain")) if (col := _resolve_col(v)) is not None]
+                business_keys = [col for v in _as_list(raw.get("business_keys")) if (col := _resolve_col(v)) is not None]
+                dimension_keys = [col for v in _as_list(raw.get("dimension_keys")) if (col := _resolve_col(v)) is not None]
                 attributes: list[str] = []
                 for value in _as_list(raw.get("attributes")):
-                    resolved = names.get(str(value).strip().lower())
+                    token = _clean_token(value)
+                    if not token or token.lower() in {"none", "n/a", "null", "-"}:
+                        continue
+                    resolved = names.get(token.lower())
                     if resolved is None:
                         # Attributes are optional descriptive hints. Removing an invented
                         # attribute is safe when all role-critical fields validate below.
@@ -648,12 +658,24 @@ def infer_semantics_hybrid(db: Session, project_id: str) -> dict[str, Any]:
                 for m in raw.get("measures") or []:
                     if not isinstance(m, dict):
                         continue
-                    source = _resolve_col(str(m.get("source_column") or ""))
+                    raw_source = _clean_token(m.get("source_column") or m.get("name") or "")
+                    source = _resolve_col(raw_source)
+                    if not source:
+                        continue
                     measures.append({
-                        "name": str(m.get("name") or source),
+                        "name": _clean_token(m.get("name") or source),
                         "source_column": source,
                         "aggregation": str(m.get("aggregation") or "NONE").upper(),
                     })
+
+                if role == "AGGREGATE":
+                    if not grain and business_keys:
+                        grain = business_keys[:]
+                    elif not business_keys and grain:
+                        business_keys = grain[:]
+                    elif not grain and not business_keys and pk:
+                        grain = pk[:]
+                        business_keys = pk[:]
 
             # Low confidence or ENTITY → preserve REVIEW_REQUIRED, do not store.
                 if role == "ENTITY" or confidence < 0.75:
@@ -835,10 +857,41 @@ def upsert_explicit_semantic(db: Session, project_id: str, object_id: str, data:
     db.commit(); return row
 
 
-def approve_semantic(db: Session, project_id: str, semantic_id: str, actor: str) -> MigrationSemanticDefinition:
+def approve_semantic(
+    db: Session, project_id: str, semantic_id: str, actor: str, role: str | None = None
+) -> MigrationSemanticDefinition:
     row = db.get(MigrationSemanticDefinition, semantic_id)
     if not row or row.project_id != project_id:
         raise ValueError("Semantic definition not found in project")
+
+    if role:
+        role_upper = str(role).upper().strip()
+        if role_upper not in GOLD_ROLES:
+            raise ValueError(f"Role must be one of {', '.join(sorted(GOLD_ROLES))}")
+        row.semantic_role = role_upper
+        obj = db.get(MigrationObject, row.object_id) if row.object_id else None
+        obj_name = obj.object_name if obj else "model"
+        row.target_name = (
+            ("fact_" if role_upper == "FACT" else "dim_" if role_upper == "DIMENSION" else "agg_" if role_upper == "AGGREGATE" else "gold_")
+            + _clean_name(obj_name).lower()
+        )
+        if obj:
+            cols = _columns(db, project_id, obj.id)
+            pk = _primary_key(db, project_id, obj.id)
+            key_like = [c.column_name for c in cols if re.search(r"(?:^id$|id$|key$)", c.column_name, re.I)]
+            keys = pk or key_like[:2]
+            current_bk = _loads(row.business_keys_json, [])
+            current_grain = _loads(row.grain_json, [])
+            current_measures = _loads(row.measures_json, [])
+            if not current_bk and keys:
+                row.business_keys_json = _json(keys)
+            if not current_grain and keys and role_upper in {"FACT", "AGGREGATE"}:
+                row.grain_json = _json(keys)
+            if not current_measures and role_upper in {"FACT", "AGGREGATE", "KPI"}:
+                numeric = [c.column_name for c in cols if c.data_type.lower().split("(", 1)[0] in NUMERIC_TYPES and c.column_name not in keys]
+                if numeric:
+                    row.measures_json = _json([{"name": m, "source_column": m, "aggregation": "NONE"} for m in numeric])
+
     if row.semantic_role not in GOLD_ROLES:
         raise ValueError("Only FACT/DIMENSION/AGGREGATE/KPI/REPORTING definitions can be approved for Gold generation")
     # Revalidate at approval time so source drift cannot silently invalidate business semantics.
@@ -858,6 +911,45 @@ def approve_semantic(db: Session, project_id: str, semantic_id: str, actor: str)
         raise ValueError(f"{row.semantic_role} approval requires explicit measures")
     row.status = "APPROVED"; row.approved_by = actor; row.approved_at = datetime.utcnow()
     db.commit(); return row
+
+
+def approve_all_semantics(db: Session, project_id: str, actor: str) -> dict[str, Any]:
+    rows = list(db.scalars(select(MigrationSemanticDefinition).where(
+        MigrationSemanticDefinition.project_id == project_id,
+        MigrationSemanticDefinition.status != "APPROVED",
+    )).all())
+    approved_count = 0
+    errors = []
+    for row in rows:
+        target_role = None
+        if row.semantic_role not in GOLD_ROLES:
+            measures = _loads(row.measures_json, [])
+            target_role = "AGGREGATE" if measures else "DIMENSION"
+        try:
+            approve_semantic(db, project_id, row.id, actor, role=target_role)
+            approved_count += 1
+        except Exception as exc:
+            errors.append(f"{row.target_name or row.id}: {exc}")
+    db.commit()
+    return {"approved_count": approved_count, "errors": errors, "total": len(rows)}
+
+
+def approve_all_medallion_artifacts(
+    db: Session, project_id: str, *, environment: str = "DEV", reviewer: str = "system"
+) -> dict[str, Any]:
+    env = environment.upper()
+    artifacts = list_medallion_artifacts(db, project_id, environment=env)
+    approved_count = 0
+    errors = []
+    for a in artifacts:
+        if a["validation_status"] == "PASSED" and a["executable"] and a["review_status"] != "APPROVED":
+            try:
+                review_medallion_artifact(db, project_id, a["artifact_version_id"], status="APPROVED", reviewer=reviewer)
+                approved_count += 1
+            except Exception as exc:
+                errors.append(f"{a['target_fqn']}: {exc}")
+    db.commit()
+    return {"approved_count": approved_count, "errors": errors, "total": len(artifacts)}
 
 
 def _upsert_node(db: Session, *, project_id: str, source_object_id: str | None, semantic_definition_id: str | None,

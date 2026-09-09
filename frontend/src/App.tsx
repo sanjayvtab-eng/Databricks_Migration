@@ -644,20 +644,42 @@ export default function App() {
       return r;
     });
   }
-  async function approveSemantic(id: string) {
+  async function approveSemantic(id: string, role?: string) {
     if (!pid) return;
-    if (
-      !confirm(
-        "Approve this semantic definition for Gold generation? This explicitly accepts the inferred/business semantics.",
-      )
-    )
-      return;
+    const confirmMsg = role
+      ? `Resolve and approve this semantic definition as ${role}?`
+      : "Approve this semantic definition for Gold generation? This explicitly accepts the inferred/business semantics.";
+    if (!confirm(confirmMsg)) return;
     await action(async () => {
       const r = await api(`/projects/${pid}/semantics/${id}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ actor: "admin", role }),
+      });
+      setSemantics(await api(`/projects/${pid}/semantics`));
+      return r;
+    });
+  }
+  async function approveAllSemantics() {
+    if (!pid) return;
+    if (!confirm("Approve all unapproved semantic definitions? Ambiguous entities with measures will be resolved as AGGREGATE.")) return;
+    await action(async () => {
+      const r: any = await api(`/projects/${pid}/semantics/approve-all`, {
         method: "POST",
         body: JSON.stringify({ actor: "admin" }),
       });
       setSemantics(await api(`/projects/${pid}/semantics`));
+      return r;
+    });
+  }
+  async function approveAllMedallionArtifacts() {
+    if (!pid) return;
+    if (!confirm("Approve all validated and executable Medallion artifacts for DEV deployment?")) return;
+    await action(async () => {
+      const r: any = await api(`/projects/${pid}/medallion/artifacts/approve-all?environment=DEV`, {
+        method: "POST",
+        body: JSON.stringify({ reviewer: "admin" }),
+      });
+      setMedArts(await api(`/projects/${pid}/medallion/artifacts?environment=DEV`));
       return r;
     });
   }
@@ -2073,13 +2095,27 @@ export default function App() {
               <Panel
                 title="Fact / dimension semantics"
                 actions={
-                  <button
-                    disabled={!pid || busy}
-                    onClick={inferBusinessSemantics}
-                  >
-                    <RefreshCw size={15} />
-                    Re-infer
-                  </button>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                    <button
+                      disabled={
+                        !pid ||
+                        busy ||
+                        !semantics.some((x: any) => x.status !== "APPROVED")
+                      }
+                      onClick={approveAllSemantics}
+                      title="Approve all valid and recommended semantics for Gold generation"
+                    >
+                      <CheckCircle2 size={15} />
+                      Approve all semantics
+                    </button>
+                    <button
+                      disabled={!pid || busy}
+                      onClick={inferBusinessSemantics}
+                    >
+                      <RefreshCw size={15} />
+                      Re-infer
+                    </button>
+                  </div>
                 }
               >
                 {semantics.length ? (
@@ -2179,6 +2215,29 @@ export default function App() {
                                   >
                                     Approve
                                   </button>
+                                )}
+                                {x.status !== "APPROVED" && (!canApprove || x.status === "REVIEW_REQUIRED") && (
+                                  <div style={{ display: "inline-flex", gap: "4px" }}>
+                                    <button
+                                      className="primary-action"
+                                      title="Resolve and approve this entity as an AGGREGATE model"
+                                      onClick={() => approveSemantic(x.id, "AGGREGATE")}
+                                    >
+                                      Resolve AGGREGATE
+                                    </button>
+                                    <button
+                                      title="Resolve and approve this entity as a FACT table"
+                                      onClick={() => approveSemantic(x.id, "FACT")}
+                                    >
+                                      Resolve FACT
+                                    </button>
+                                    <button
+                                      title="Resolve and approve this entity as a DIMENSION table"
+                                      onClick={() => approveSemantic(x.id, "DIMENSION")}
+                                    >
+                                      Resolve DIMENSION
+                                    </button>
+                                  </div>
                                 )}
                                 {x.object_id && (
                                   <button
@@ -3189,7 +3248,29 @@ export default function App() {
             </>
           )}
           {page === "Reviews" && (
-            <Panel title="Governed Medallion artifact reviews">
+            <Panel
+              title="Governed Medallion artifact reviews"
+              actions={
+                <button
+                  className="primary-action"
+                  disabled={
+                    !pid ||
+                    busy ||
+                    !medArts.some(
+                      (a: any) =>
+                        a.validation_status === "PASSED" &&
+                        a.executable &&
+                        a.review_status !== "APPROVED",
+                    )
+                  }
+                  onClick={approveAllMedallionArtifacts}
+                  title="Approve all validated artifacts to proceed directly to DEV deployment"
+                >
+                  <CheckCircle2 size={15} />
+                  Approve all validated artifacts for DEV
+                </button>
+              }
+            >
               {medArts.length ? (
                 <>
                   <div className="ai-guardrail">

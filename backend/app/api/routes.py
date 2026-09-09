@@ -24,9 +24,9 @@ from app.services.deployment import (
 )
 from app.services.medallion import (
     analyze_downstream_consumers, register_external_consumer, infer_semantics, infer_semantics_hybrid, list_semantics,
-    upsert_explicit_semantic, approve_semantic, build_medallion_plan, medallion_plan,
+    upsert_explicit_semantic, approve_semantic, approve_all_semantics, build_medallion_plan, medallion_plan,
     generate_medallion_artifacts, list_medallion_artifacts, review_medallion_artifact,
-    remediate_medallion_artifact, deploy_medallion_dev,
+    remediate_medallion_artifact, deploy_medallion_dev, approve_all_medallion_artifacts,
 )
 from app.services.ai_remediation import (
     accept_remediation,
@@ -86,7 +86,7 @@ class SemanticIn(BaseModel):
     scd_type:str|None=None
     notes:str|None=None
 
-class SemanticApproveIn(BaseModel): actor:str="admin"
+class SemanticApproveIn(BaseModel): actor:str="admin"; role:str|None=None
 class MedallionPlanIn(BaseModel): environment:str="DEV"; catalog:str|None=None
 class MedallionReviewIn(BaseModel): status:str="APPROVED"; reviewer:str="admin"
 class MedallionDeployIn(BaseModel): allow_destructive:bool=False; batch_size:int=10000; max_rows:int|None=None
@@ -617,8 +617,14 @@ def semantics_upsert_api(project_id:str,data:SemanticIn,db:Session=Depends(get_d
 @router.post("/projects/{project_id}/semantics/{semantic_id}/approve")
 def semantics_approve_api(project_id:str,semantic_id:str,data:SemanticApproveIn,db:Session=Depends(get_db),_=Depends(auth)):
     try:
-        row=approve_semantic(db,project_id,semantic_id,data.actor)
-        return {"id":row.id,"status":row.status,"approved_by":row.approved_by,"approved_at":row.approved_at}
+        row=approve_semantic(db,project_id,semantic_id,data.actor,role=data.role)
+        return {"id":row.id,"status":row.status,"approved_by":row.approved_by,"approved_at":row.approved_at,"semantic_role":row.semantic_role,"target_name":row.target_name}
+    except ValueError as e: raise HTTPException(400,str(e))
+
+@router.post("/projects/{project_id}/semantics/approve-all")
+def semantics_approve_all_api(project_id:str,data:SemanticApproveIn,db:Session=Depends(get_db),_=Depends(auth)):
+    try:
+        return approve_all_semantics(db,project_id,data.actor)
     except ValueError as e: raise HTTPException(400,str(e))
 
 @router.post("/projects/{project_id}/medallion/plan")
@@ -638,6 +644,12 @@ def medallion_generate_api(project_id:str,environment:str="DEV",db:Session=Depen
 @router.get("/projects/{project_id}/medallion/artifacts")
 def medallion_artifacts_api(project_id:str,environment:str="DEV",db:Session=Depends(get_db),_=Depends(auth)):
     return list_medallion_artifacts(db,project_id,environment=environment)
+
+@router.post("/projects/{project_id}/medallion/artifacts/approve-all")
+def medallion_artifacts_approve_all_api(project_id:str,data:MedallionReviewIn,environment:str="DEV",db:Session=Depends(get_db),_=Depends(auth)):
+    try:
+        return approve_all_medallion_artifacts(db,project_id,environment=environment,reviewer=data.reviewer)
+    except ValueError as e: raise HTTPException(400,str(e))
 
 @router.post("/projects/{project_id}/medallion/artifacts/{version_id}/review")
 def medallion_artifact_review_api(project_id:str,version_id:str,data:MedallionReviewIn,db:Session=Depends(get_db),_=Depends(auth)):
