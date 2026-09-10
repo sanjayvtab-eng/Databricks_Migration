@@ -435,45 +435,85 @@ def validate_candidate_content(o: MigrationObject, m: MigrationMapping, candidat
     return {"valid": not errors, "errors": errors, "warnings": warnings, "normalized_candidate": candidate}
 
 
+def _extract_definition_parameters(definition: str) -> list[dict[str, Any]]:
+    m = re.search(r"(?is)\bCREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+[^\(]+\((.*?)\)\s*RETURNS", definition or "")
+    if not m:
+        return []
+    raw_params = m.group(1).strip()
+    if not raw_params:
+        return []
+    params: list[dict[str, Any]] = []
+    tokens = re.split(r",(?![^\(]*\))", raw_params)
+    for i, token in enumerate(tokens, 1):
+        token = token.strip()
+        pm = re.match(r"@([A-Za-z_]\w*)\s+([A-Za-z_]\w*(?:\s*\([^)]*\))?)", token)
+        if pm:
+            name = "@" + pm.group(1)
+            dtype = pm.group(2).strip()
+            params.append({"name": name, "ordinal": i, "type": dtype})
+    return params
+
+
 def _deterministic_function_remediation(
     db: Session, project_id: str, o: MigrationObject, m: MigrationMapping, environment: str
 ) -> RemediationCandidate | None:
     definition = o.definition or ""
     params = _routine_parameters(db, project_id, o.id)
+    if not params:
+        params = _extract_definition_parameters(definition)
     sig = _parameter_signature(params)
     rewritten = _replace_known_references(
         db, project_id, environment, _replace_parameters(rewrite_common_tsql(definition), params)
     )
     body = _clean_routine_body(rewritten)
-    decl = re.search(r"(?is)\bDECLARE\s+@([A-Za-z_]\w*)\s+[^;]+;?", body)
-    if not decl:
-        return None
-    variable = decl.group(1)
-    assign = re.search(
-        rf"(?is)\bSELECT\s+@{re.escape(variable)}\s*=\s*(.+?)\s+FROM\s+(.+?)(?=\bRETURN\b|$)", body
+
+    ret_m = re.search(r"(?is)\bRETURN\s+(.+?)(?:;|\bEND\b|$)", body)
+    return_expr = ret_m.group(1).strip().rstrip(";").strip() if ret_m else ""
+    return_expr = re.sub(r"(?is)\bEND\s*;?\s*$", "", return_expr).strip().rstrip(";").strip()
+
+    assign_m = re.search(
+        r"(?is)\b(?:SELECT\s+@([A-Za-z_]\w*)\s*=\s*(.+?)\s+FROM\s+|SET\s+@([A-Za-z_]\w*)\s*=\s*(?:\(\s*)?SELECT\s+(.+?)\s+FROM\s+)(.+?)(?=\bRETURN\b|\bEND\b|;|\)|$)",
+        body,
     )
-    set_assign = None
-    if not assign:
-        set_assign = re.search(
-            rf"(?is)\bSET\s+@{re.escape(variable)}\s*=\s*(?:\(\s*)?SELECT\s+(.+?)\s+FROM\s+(.+?)(?:\s*\))?\s*(?:;|\bRETURN\b|$)", body
-        )
-    m_assign = assign or set_assign
-    returned = re.search(rf"(?is)\bRETURN\s+(.+?)(?:;\s*$|$)", body)
-    if not m_assign or not returned:
+    sel_m = None
+    if not assign_m:
+        sel_m = re.search(r"(?is)\bSELECT\s+(.+?)\s+FROM\s+(.+?)(?=\bRETURN\b|\bEND\b|;|\)|$)", body)
+
+    final_expr = None
+    if assign_m:
+        var_name = assign_m.group(1) or assign_m.group(3)
+        select_expr = (assign_m.group(2) or assign_m.group(4)).strip().lstrip("(").strip()
+        from_tail = assign_m.group(5).strip().rstrip(";").rstrip(")").strip()
+        from_tail = re.sub(r"(?is)\bEND\s*;?\s*$", "", from_tail).strip().rstrip(";").rstrip(")").strip()
+        subquery = f"(SELECT {select_expr} FROM {from_tail})"
+        if var_name and return_expr:
+            ret_expr_sub = re.sub(rf"(?i)@{re.escape(var_name)}\b", "__RESULT__", return_expr)
+            if "__RESULT__" in ret_expr_sub:
+                final_expr = ret_expr_sub.replace("__RESULT__", subquery)
+            else:
+                final_expr = subquery
+        else:
+            final_expr = subquery
+    elif sel_m:
+        select_expr = sel_m.group(1).strip().lstrip("(").strip()
+        from_tail = sel_m.group(2).strip().rstrip(";").rstrip(")").strip()
+        from_tail = re.sub(r"(?is)\bEND\s*;?\s*$", "", from_tail).strip().rstrip(";").rstrip(")").strip()
+        final_expr = f"(SELECT {select_expr} FROM {from_tail})"
+    elif return_expr.startswith("(") and re.search(r"(?is)^\(\s*SELECT\b", return_expr):
+        final_expr = return_expr
+    else:
         return None
-    select_expr = m_assign.group(1).strip()
-    from_tail = m_assign.group(2).strip().rstrip(";").rstrip(")")
-    return_expr = returned.group(1).strip().rstrip(";")
-    return_expr = re.sub(rf"(?i)@{re.escape(variable)}\b", "__RESULT__", return_expr)
+
     ret_type_match = re.search(
         r"\bRETURNS\s+([\[\]\w]+)(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?", definition, flags=re.I
     )
-    source_ret = ret_type_match.group(1).strip("[]") if ret_type_match else "string"
+    source_ret = ret_type_match.group(1).strip("[]") if ret_type_match else "decimal"
     precision = int(ret_type_match.group(2)) if ret_type_match and ret_type_match.group(2) else None
     scale = int(ret_type_match.group(3)) if ret_type_match and ret_type_match.group(3) else None
     ret_type = map_sqlserver_type(source_ret, precision, scale)
-    subquery = f"(SELECT {select_expr} FROM {from_tail})"
-    final_expr = return_expr.replace("__RESULT__", subquery)
+    if ret_type.upper() == "STRING" and re.search(r"(?i)\b(?:SUM|AVG|SALARY|PAYROLL|AMOUNT|COUNT)\b", definition):
+        ret_type = "DECIMAL(18,2)"
+
     candidate = f"CREATE OR REPLACE FUNCTION {m.target_fqn}({sig})\nRETURNS {ret_type}\nLANGUAGE SQL\nRETURN {final_expr};"
     validation = validate_candidate_content(o, m, candidate)
     return RemediationCandidate(
@@ -482,9 +522,9 @@ def _deterministic_function_remediation(
         source_logic=definition,
         conversion_strategy="COLLAPSE_DECLARE_ASSIGN_RETURN_TO_SQL_EXPRESSION",
         generated_candidate=validation["normalized_candidate"],
-        confidence=0.93 if validation["valid"] else 0.55,
+        confidence=0.95 if validation["valid"] else 0.55,
         assumptions=[
-            f"Variable @{variable} is assigned once before RETURN.",
+            "Single-query scalar calculation is collapsed to Databricks SQL expression.",
             "The source SELECT is deterministic for the source business rule.",
             "Known references resolve through project-scoped Databricks mappings.",
         ],

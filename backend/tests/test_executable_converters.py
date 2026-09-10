@@ -206,3 +206,82 @@ def test_function_with_set_syntax_collapses_to_executable_sql(db):
     assert rem['confidence'] >= 0.90
 
 
+def test_function_with_select_assign_and_coalesce_return(db):
+    p = ensure_project(db, 'Function select assign project')
+    s = add_source(db, p.id, 'src', 'server', 'DB1')
+    snapshot = {'database': 'DB1', 'objects': [
+        {'schema': 'dbo', 'name': 'employees', 'type': 'TABLE', 'columns': [
+            {'name': 'department_id', 'type': 'int'}, {'name': 'salary', 'type': 'decimal', 'precision': 10, 'scale': 2}
+        ]},
+        {'schema': 'dbo', 'name': 'total_department_payroll', 'type': 'FUNCTION', 'definition': '''
+            CREATE FUNCTION dbo.total_department_payroll (@department_id INT)
+            RETURNS DECIMAL(18,2)
+            AS
+            BEGIN
+                DECLARE @total_payroll DECIMAL(18,2);
+                SELECT @total_payroll = SUM(salary)
+                FROM dbo.employees
+                WHERE department_id = @department_id;
+                RETURN ISNULL(@total_payroll, 0);
+            END;
+        ''', 'parameters': [
+            {'name': '@department_id', 'ordinal': 1, 'type': 'int'}
+        ]}
+    ]}
+    ingest_snapshot(db, p.id, s.id, snapshot)
+    classify_project(db, p.id)
+    create_mappings(db, p.id, 'DEV', 'migration_dev')
+
+    from app.services.ai_remediation import analyze_remediation, remediate_one_artifact
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'total_department_payroll',
+    ))
+    generate_artifact(db, p.id, obj.id)
+    rem = analyze_remediation(db, p.id, obj.id, 'DEV', use_ai=False)
+    assert 'CREATE OR REPLACE FUNCTION' in rem['generated_candidate']
+    assert 'READS SQL DATA' in rem['generated_candidate']
+    assert 'RETURN coalesce((SELECT' in rem['generated_candidate']
+    assert '`department_id` INT' in rem['generated_candidate']
+
+    repaired = remediate_one_artifact(db, p.id, obj.id, environment='DEV', use_ai=False)
+    assert repaired['status'] == 'READY_FOR_REVIEW'
+    assert repaired['static_validation']['valid'] is True
+
+
+def test_function_remediation_parses_definition_parameters_when_metadata_missing(db):
+    p = ensure_project(db, 'Function missing params project')
+    s = add_source(db, p.id, 'src', 'server', 'DB1')
+    # Notice: 'parameters' is omitted from snapshot!
+    snapshot = {'database': 'DB1', 'objects': [
+        {'schema': 'dbo', 'name': 'employees', 'type': 'TABLE', 'columns': [
+            {'name': 'department_id', 'type': 'int'}, {'name': 'salary', 'type': 'decimal', 'precision': 10, 'scale': 2}
+        ]},
+        {'schema': 'dbo', 'name': 'total_department_payroll', 'type': 'FUNCTION', 'definition': '''
+            CREATE FUNCTION dbo.total_department_payroll (@dept_id INT)
+            RETURNS DECIMAL(18,2)
+            AS
+            BEGIN
+                DECLARE @total DECIMAL(18,2);
+                SELECT @total = SUM(salary) FROM employees WHERE department_id = @dept_id;
+                RETURN @total;
+            END
+        '''}
+    ]}
+    ingest_snapshot(db, p.id, s.id, snapshot)
+    classify_project(db, p.id)
+    create_mappings(db, p.id, 'DEV', 'migration_dev')
+
+    from app.services.ai_remediation import analyze_remediation
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'total_department_payroll',
+    ))
+    generate_artifact(db, p.id, obj.id)
+    rem = analyze_remediation(db, p.id, obj.id, 'DEV', use_ai=False)
+    assert 'CREATE OR REPLACE FUNCTION' in rem['generated_candidate']
+    assert '`dept_id` INT' in rem['generated_candidate']
+    assert 'READS SQL DATA' in rem['generated_candidate']
+    assert rem['deterministic_validation']['valid'] is True
+
+

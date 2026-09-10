@@ -225,12 +225,23 @@ def _replace_known_references(db: Session, project_id: str, environment: str, co
             continue
         _,sch,name=parts
         patterns=[
-            rf"(?<![\w`])\[{re.escape(sch)}\]\.\[{re.escape(name)}\](?![\w`])",
-            rf"(?<![\w`]){re.escape(sch)}\.{re.escape(name)}(?![\w`])",
-            rf"(?<![\w`])`{re.escape(sch)}`\.`{re.escape(name)}`(?![\w`])",
+            rf"(?<![\w`])\[?{re.escape(sch)}\]?\.\[?{re.escape(name)}\]?(?![\w`])",
+            rf"(?<![\w`])`?{re.escape(sch)}`?\.`?{re.escape(name)}`?(?![\w`])",
         ]
         for pat in patterns:
-            out=re.sub(pat,x.target_fqn,out,flags=re.I)
+            out=re.sub(pat,lambda _: x.target_fqn,out,flags=re.I)
+        table_patterns=[
+            rf"(?i)(?<=\bFROM\s)\[?{re.escape(name)}\]?(?![\w`\.])",
+            rf"(?i)(?<=\bJOIN\s)\[?{re.escape(name)}\]?(?![\w`\.])",
+            rf"(?i)(?<=\bINTO\s)\[?{re.escape(name)}\]?(?![\w`\.])",
+            rf"(?i)(?<=\bUPDATE\s)\[?{re.escape(name)}\]?(?![\w`\.])",
+            rf"(?i)(?<=\bFROM\s)`{re.escape(name)}`(?![\w`\.])",
+            rf"(?i)(?<=\bJOIN\s)`{re.escape(name)}`(?![\w`\.])",
+            rf"(?i)(?<=\bINTO\s)`{re.escape(name)}`(?![\w`\.])",
+            rf"(?i)(?<=\bUPDATE\s)`{re.escape(name)}`(?![\w`\.])",
+        ]
+        for pat in table_patterns:
+            out=re.sub(pat,lambda _: x.target_fqn,out)
     return out
 
 
@@ -239,7 +250,8 @@ def _clean_routine_body(definition: str) -> str:
     m=re.search(r"\bAS\b(.*)$",definition or "",flags=re.I|re.S)
     body=(m.group(1) if m else definition or "").strip()
     body=re.sub(r"^\s*BEGIN\b","",body,flags=re.I).strip()
-    body=re.sub(r"\bEND\s*;?\s*$","",body,flags=re.I).strip()
+    body=re.sub(r"(?is)\bGO\s*;?\s*$", "", body).strip()
+    body=re.sub(r"(?is)\bEND\s*;?\s*$", "", body).strip()
     body=re.sub(r"\bSET\s+NOCOUNT\s+ON\s*;?","",body,flags=re.I)
     body=re.sub(r"\bSET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
     body=re.sub(r"\bSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
