@@ -30,6 +30,7 @@ from .engine import (
     _replace_known_references,
     _replace_parameters,
     _routine_parameters,
+    _rewrite_static_procedure_calls,
     databricks_routine_contract_issues,
     normalize_databricks_routine_contract,
     sha,
@@ -451,11 +452,17 @@ def _deterministic_function_remediation(
     assign = re.search(
         rf"(?is)\bSELECT\s+@{re.escape(variable)}\s*=\s*(.+?)\s+FROM\s+(.+?)(?=\bRETURN\b|$)", body
     )
+    set_assign = None
+    if not assign:
+        set_assign = re.search(
+            rf"(?is)\bSET\s+@{re.escape(variable)}\s*=\s*(?:\(\s*)?SELECT\s+(.+?)\s+FROM\s+(.+?)(?:\s*\))?\s*(?:;|\bRETURN\b|$)", body
+        )
+    m_assign = assign or set_assign
     returned = re.search(rf"(?is)\bRETURN\s+(.+?)(?:;\s*$|$)", body)
-    if not assign or not returned:
+    if not m_assign or not returned:
         return None
-    select_expr = assign.group(1).strip()
-    from_tail = assign.group(2).strip().rstrip(";")
+    select_expr = m_assign.group(1).strip()
+    from_tail = m_assign.group(2).strip().rstrip(";").rstrip(")")
     return_expr = returned.group(1).strip().rstrip(";")
     return_expr = re.sub(rf"(?i)@{re.escape(variable)}\b", "__RESULT__", return_expr)
     ret_type_match = re.search(
@@ -489,6 +496,58 @@ def _deterministic_function_remediation(
             "Run artifact-version-specific static validation.",
             "Execute only after explicit approval in DEV.",
             "Compare representative source and Databricks results.",
+        ],
+        provider="DETERMINISTIC_REMEDIATION",
+        model=None,
+        deterministic_validation=validation,
+    )
+
+
+def _deterministic_procedure_remediation(
+    db: Session, project_id: str, o: MigrationObject, m: MigrationMapping, environment: str
+) -> RemediationCandidate | None:
+    definition = o.definition or ""
+    params = _routine_parameters(db, project_id, o.id)
+    sig = _parameter_signature(params, procedure=True)
+    body = _clean_routine_body(definition)
+    body = _replace_parameters(rewrite_common_tsql(body), params)
+    body = _replace_known_references(db, project_id, environment, body)
+    body = _rewrite_static_procedure_calls(body)
+
+    clean_body = re.sub(r"(?is)\bBEGIN\s+TRAN(?:SACTION)?\s*;?", "", body)
+    clean_body = re.sub(r"(?is)\bCOMMIT\s+TRAN(?:SACTION)?\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bCOMMIT\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bROLLBACK\s+TRAN(?:SACTION)?\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bBEGIN\s+TRY\b\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bEND\s+TRY\b\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bBEGIN\s+CATCH\b[\s\S]*?\bEND\s+CATCH\b\s*;?", "", clean_body)
+    clean_body = clean_body.strip()
+
+    if not clean_body or any(x in clean_body.lower() for x in ("goto ", "waitfor ", "sp_executesql")):
+        return None
+
+    candidate = (
+        f"CREATE OR REPLACE PROCEDURE {m.target_fqn}({sig})\n"
+        f"LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN\n{clean_body.rstrip(';')};\nEND;"
+    )
+    validation = validate_candidate_content(o, m, candidate)
+    return RemediationCandidate(
+        object_id=o.id,
+        issue_id=None,
+        source_logic=definition,
+        conversion_strategy="STRIP_TRANSACTION_WRAPPERS_TO_SQL_PROCEDURE",
+        generated_candidate=validation["normalized_candidate"],
+        confidence=0.95 if validation["valid"] else 0.50,
+        assumptions=[
+            "Databricks Delta Lake is ACID by default; explicit transaction boundaries are omitted.",
+            "Static SQL statements run atomically within the procedure body.",
+        ],
+        risks=[
+            "Multi-statement rollback behavior differs from full procedural transactions.",
+        ],
+        validation_plan=[
+            "Run artifact-version-specific static validation.",
+            "Execute in DEV environment to verify parameters and DML statements.",
         ],
         provider="DETERMINISTIC_REMEDIATION",
         model=None,
@@ -865,7 +924,11 @@ def analyze_remediation(
         raise ValueError("Runtime compatibility failures are handled by the deterministic compatibility engine, not by rewriting migration SQL with AI")
     context = _context(db, project_id, o, environment)
 
-    local = _deterministic_function_remediation(db, project_id, o, m, environment) if o.object_type == "FUNCTION" else None
+    local = None
+    if o.object_type == "FUNCTION":
+        local = _deterministic_function_remediation(db, project_id, o, m, environment)
+    elif o.object_type == "PROCEDURE":
+        local = _deterministic_procedure_remediation(db, project_id, o, m, environment)
     attempts: list[dict[str, Any]] = []
     if local and local.deterministic_validation.get("valid"):
         local.issue_id = issue.id if issue else None

@@ -38,6 +38,11 @@ def normalize_databricks_routine_contract(content: str, object_type: str) -> str
                 content = re.sub(r"(?is)\bCONTAINS\s+SQL\s*\n?", "", content)
             else:
                 content = re.sub(r"(?is)\bCONTAINS\s+SQL\b", "READS SQL DATA", content)
+        elif reads_data and not has_reads:
+            language = re.search(r"(?is)\bLANGUAGE\s+SQL\b", content)
+            if language:
+                remainder = content[language.end():].lstrip()
+                content = content[:language.end()] + "\nREADS SQL DATA\n" + remainder
         return content
 
     return content
@@ -304,17 +309,25 @@ def _convert_procedure(db: Session, project_id: str, o: MigrationObject, m: Migr
         reason=f"{intent} contains unsupported dynamic/external behavior; deterministic conversion stopped safely."
         return (f"-- PROCEDURE_CLASSIFICATION: {intent}\n-- RECOMMENDED_TARGET: {target}\n-- NON_EXECUTABLE: {reason}\n"+body,False,reason)
 
-    # Databricks SQL stored procedures are supported on DBR/DBSQL 17.0+ in Unity Catalog.
-    # Keep the body as SQL scripting so parameterized SELECT and DML procedures remain executable.
-    # Normalize a few T-SQL constructs but fail safe on known incompatible control-flow syntax.
-    incompatible=("goto ","waitfor ","try\n","catch\n","begin tran","commit tran","rollback tran")
-    if any(x in low for x in incompatible):
-        reason=f"{intent} contains transaction/control-flow constructs requiring SQL scripting remediation."
+    # Clean transaction and try-catch wrappers: Databricks Delta Lake is ACID by default
+    clean_body = re.sub(r"(?is)\bBEGIN\s+TRAN(?:SACTION)?\s*;?", "", body)
+    clean_body = re.sub(r"(?is)\bCOMMIT\s+TRAN(?:SACTION)?\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bCOMMIT\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bROLLBACK\s+TRAN(?:SACTION)?\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bBEGIN\s+TRY\b\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bEND\s+TRY\b\s*;?", "", clean_body)
+    clean_body = re.sub(r"(?is)\bBEGIN\s+CATCH\b[\s\S]*?\bEND\s+CATCH\b\s*;?", "", clean_body)
+    clean_body = clean_body.strip()
+
+    low_clean = clean_body.lower()
+    incompatible=("goto ","waitfor ")
+    if any(x in low_clean for x in incompatible):
+        reason=f"{intent} contains control-flow constructs requiring SQL scripting remediation."
         return (f"-- PROCEDURE_CLASSIFICATION: {intent}\n-- RECOMMENDED_TARGET: {target}\n-- NON_EXECUTABLE: {reason}\n"+body,False,reason)
 
-    if body:
+    if clean_body:
         content=(f"CREATE OR REPLACE PROCEDURE {m.target_fqn}({sig})\n"
-                 f"LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN\n{body.rstrip(';')};\nEND;")
+                 f"LANGUAGE SQL\nSQL SECURITY INVOKER\nAS BEGIN\n{clean_body.rstrip(';')};\nEND;")
         content = normalize_databricks_routine_contract(content, "PROCEDURE")
         return (content,True,f"{intent}_TO_DATABRICKS_SQL_PROCEDURE")
     reason="Procedure body could not be parsed safely."

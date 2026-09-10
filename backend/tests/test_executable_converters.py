@@ -129,3 +129,80 @@ def test_ai_function_candidate_replaces_contains_sql_with_reads_sql_data(db):
     assert result['valid'] is True
     assert 'READS SQL DATA' in result['normalized_candidate']
     assert 'CONTAINS SQL' not in result['normalized_candidate']
+
+
+def test_procedure_with_transactions_converts_to_executable_databricks_sql(db):
+    p = ensure_project(db, 'Proc transaction project')
+    s = add_source(db, p.id, 'src', 'server', 'DB1')
+    snapshot = {'database': 'DB1', 'objects': [
+        {'schema': 'dbo', 'name': 'employees', 'type': 'TABLE', 'columns': [
+            {'name': 'employee_id', 'type': 'int'}, {'name': 'salary', 'type': 'decimal', 'precision': 10, 'scale': 2}
+        ]},
+        {'schema': 'dbo', 'name': 'hr_pkg_give_raise', 'type': 'PROCEDURE', 'definition': '''
+            CREATE PROCEDURE dbo.hr_pkg_give_raise @emp_id INT, @pct DECIMAL(5,2)
+            AS
+            BEGIN
+                BEGIN TRANSACTION;
+                UPDATE dbo.employees
+                SET salary = salary * (1 + @pct / 100.0)
+                WHERE employee_id = @emp_id;
+                COMMIT TRANSACTION;
+            END
+        ''', 'parameters': [
+            {'name': '@emp_id', 'ordinal': 1, 'type': 'int'},
+            {'name': '@pct', 'ordinal': 2, 'type': 'decimal', 'precision': 5, 'scale': 2}
+        ]}
+    ]}
+    ingest_snapshot(db, p.id, s.id, snapshot)
+    classify_project(db, p.id)
+    create_mappings(db, p.id, 'DEV', 'migration_dev')
+
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'hr_pkg_give_raise',
+    ))
+    art = generate_artifact(db, p.id, obj.id)
+    assert 'CREATE OR REPLACE PROCEDURE' in art.content
+    assert 'BEGIN TRANSACTION' not in art.content
+    assert 'COMMIT TRANSACTION' not in art.content
+    assert 'UPDATE `migration_dev`.`bronze`.`employees`' in art.content or 'UPDATE' in art.content
+    assert '-- NON_EXECUTABLE:' not in art.content
+
+
+def test_function_with_set_syntax_collapses_to_executable_sql(db):
+    p = ensure_project(db, 'Function set project')
+    s = add_source(db, p.id, 'src', 'server', 'DB1')
+    snapshot = {'database': 'DB1', 'objects': [
+        {'schema': 'dbo', 'name': 'employees', 'type': 'TABLE', 'columns': [
+            {'name': 'department_id', 'type': 'int'}, {'name': 'salary', 'type': 'decimal', 'precision': 10, 'scale': 2}
+        ]},
+        {'schema': 'dbo', 'name': 'total_department_payroll', 'type': 'FUNCTION', 'definition': '''
+            CREATE FUNCTION dbo.total_department_payroll (@dept_id INT)
+            RETURNS DECIMAL(18,2)
+            AS
+            BEGIN
+                DECLARE @total DECIMAL(18,2);
+                SET @total = (SELECT SUM(salary) FROM dbo.employees WHERE department_id = @dept_id);
+                RETURN @total;
+            END
+        ''', 'parameters': [
+            {'name': '@dept_id', 'ordinal': 1, 'type': 'int'}
+        ]}
+    ]}
+    ingest_snapshot(db, p.id, s.id, snapshot)
+    classify_project(db, p.id)
+    create_mappings(db, p.id, 'DEV', 'migration_dev')
+
+    from app.services.ai_remediation import analyze_remediation
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'total_department_payroll',
+    ))
+    generate_artifact(db, p.id, obj.id)
+    rem = analyze_remediation(db, p.id, obj.id, 'DEV', use_ai=False)
+    assert 'CREATE OR REPLACE FUNCTION' in rem['generated_candidate']
+    assert 'READS SQL DATA' in rem['generated_candidate']
+    assert 'RETURN (SELECT' in rem['generated_candidate']
+    assert rem['confidence'] >= 0.90
+
+
