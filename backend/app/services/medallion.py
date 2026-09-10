@@ -942,7 +942,8 @@ def approve_all_medallion_artifacts(
     approved_count = 0
     errors = []
     for a in artifacts:
-        if a["validation_status"] == "PASSED" and a["executable"] and a["review_status"] != "APPROVED":
+        can_approve = (a["validation_status"] == "PASSED" and a["executable"]) or a.get("node_type") == "ARCHITECTURE_REVIEW"
+        if can_approve and a["review_status"] != "APPROVED":
             try:
                 review_medallion_artifact(db, project_id, a["artifact_version_id"], status="APPROVED", reviewer=reviewer)
                 approved_count += 1
@@ -1500,7 +1501,9 @@ def review_medallion_artifact(db: Session, project_id: str, version_id: str, *, 
     if state not in {"APPROVED", "REJECTED", "CHANGES_REQUIRED"}:
         raise ValueError("status must be APPROVED, REJECTED or CHANGES_REQUIRED")
     if state == "APPROVED" and (not version.executable or version.validation_status != "PASSED"):
-        raise ValueError("Approval blocked: artifact must be executable and validation must PASSED")
+        node = db.get(MigrationMedallionNode, version.node_id)
+        if not node or node.node_type != "ARCHITECTURE_REVIEW":
+            raise ValueError("Approval blocked: artifact must be executable and validation must PASSED")
     version.review_status = state; version.reviewer = reviewer; version.reviewed_at = datetime.utcnow()
 
     # A repaired Medallion routine is derived from a governed source-object
@@ -1654,12 +1657,18 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
     artifacts = list_medallion_artifacts(db, project_id, environment=env)
     if not artifacts:
         raise ValueError("No Medallion artifacts generated")
-    blockers = [x for x in artifacts if x["review_status"] != "APPROVED" or x["validation_status"] != "PASSED" or not x["executable"]]
+    blockers = [
+        x for x in artifacts
+        if x["review_status"] != "APPROVED"
+        or (x.get("node_type") != "ARCHITECTURE_REVIEW" and (x["validation_status"] != "PASSED" or not x["executable"]))
+    ]
     if blockers:
         raise ValueError(f"Medallion deployment blocked: {len(blockers)} artifact(s) are not approved/executable/validated")
 
     runtime_contract_blockers = []
     for item in artifacts:
+        if item.get("node_type") == "ARCHITECTURE_REVIEW":
+            continue
         issues = databricks_routine_contract_issues(
             item["content"], item.get("source_object_type") or item.get("node_type") or ""
         )
@@ -1682,7 +1691,9 @@ def deploy_medallion_dev(db: Session, project_id: str, *, allow_destructive: boo
         node = node_by_id[item["node_id"]]
         obj = object_by_id.get(node.source_object_id)
         try:
-            if node.layer == "BRONZE" and obj and obj.object_type == "TABLE":
+            if node.node_type == "ARCHITECTURE_REVIEW":
+                detail = {"action": "ARCHITECTURE_REVIEW_ACKNOWLEDGED"}
+            elif node.layer == "BRONZE" and obj and obj.object_type == "TABLE":
                 transient = MigrationMapping(project_id=project_id, object_id=obj.id,
                                              source_fqn=f"{obj.database_name}.{obj.schema_name}.{obj.object_name}",
                                              target_fqn=node.target_fqn, target_layer="BRONZE", environment="DEV")

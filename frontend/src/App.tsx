@@ -3308,10 +3308,15 @@ export default function App() {
                     </thead>
                     <tbody>
                       {medArts.map((a: any) => {
+                        const isArchReview =
+                          a.node_type === "ARCHITECTURE_REVIEW" ||
+                          a.source_object_type === "TRIGGER";
                         const valid =
                           a.executable && a.validation_status === "PASSED";
+                        const canApprove = valid || isArchReview;
                         const repairable =
                           !valid &&
+                          !isArchReview &&
                           ["PROCEDURE", "FUNCTION"].includes(
                             a.source_object_type,
                           );
@@ -3325,18 +3330,22 @@ export default function App() {
                             </td>
                             <td>v{a.version}</td>
                             <td>
-                              <Badge s={a.validation_status} />
+                              <Badge s={isArchReview ? "MANUAL_REVIEW" : a.validation_status} />
                             </td>
                             <td>
                               <Badge s={a.review_status} />
                             </td>
                             <td>
                               <div className="review-actions">
-                                {valid && a.review_status !== "APPROVED" && (
+                                {canApprove && a.review_status !== "APPROVED" && (
                                   <button
                                     className="primary-action"
                                     disabled={busy}
-                                    title="Approve this validated version for DEV deployment"
+                                    title={
+                                      isArchReview
+                                        ? "Acknowledge and sign off on this architecture review for DEV deployment"
+                                        : "Approve this validated version for DEV deployment"
+                                    }
                                     onClick={() =>
                                       reviewMedArtifact(
                                         a.artifact_version_id,
@@ -3345,10 +3354,12 @@ export default function App() {
                                     }
                                   >
                                     <CheckCircle2 size={14} />
-                                    Approve for DEV
+                                    {isArchReview
+                                      ? "Acknowledge Review"
+                                      : "Approve for DEV"}
                                   </button>
                                 )}
-                                {valid && a.review_status !== "REJECTED" && (
+                                {canApprove && a.review_status !== "REJECTED" && (
                                   <button
                                     disabled={busy}
                                     onClick={() => {
@@ -3366,7 +3377,7 @@ export default function App() {
                                     Reject
                                   </button>
                                 )}
-                                {valid &&
+                                {canApprove &&
                                   a.review_status !== "CHANGES_REQUIRED" && (
                                     <button
                                       disabled={busy}
@@ -3393,7 +3404,7 @@ export default function App() {
                                     Repair with {aiProvider?.provider || "AI"}
                                   </button>
                                 )}
-                                {!valid && !repairable && (
+                                {!canApprove && !repairable && (
                                   <button
                                     disabled={busy}
                                     onClick={() => setPage("AI Remediation")}
@@ -3404,10 +3415,22 @@ export default function App() {
                                 <details>
                                   <summary>View SQL and evidence</summary>
                                   <pre>{a.content}</pre>
-                                  {!valid && (
+                                  {!valid && !isArchReview && (
                                     <div className="review-block-reason">
                                       {(a.validation?.errors || []).join("; ") ||
                                         "Static validation must pass before approval."}
+                                    </div>
+                                  )}
+                                  {isArchReview && (
+                                    <div
+                                      className="review-block-reason"
+                                      style={{
+                                        background: "#e8f0fe",
+                                        color: "#174ea6",
+                                        borderColor: "#aecbfa",
+                                      }}
+                                    >
+                                      Triggers do not exist in Databricks. Recommended target: implement as a Delta Table CHECK constraint or DLT expectation. Acknowledging this review allows DEV deployment to proceed.
                                     </div>
                                   )}
                                 </details>
