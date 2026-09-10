@@ -554,6 +554,9 @@ def classify_execution_error(exc: Exception | str, stage: str = "UNKNOWN") -> di
     elif "ARRAY<VOID>" in upper and "BINARY" in upper:
         category, code, deterministic = "LOAD", "BINARY_TRANSPORT_MISMATCH", True
         action = "Use the canonical HEX_STRING_TO_BINARY adapter so connector inference cannot produce ARRAY<VOID>, then resume the load."
+    elif "BINARY_OP_WRONG_TYPE" in upper or "STRING_CONCATENATION" in upper:
+        category, code = "DATABRICKS_SYNTAX", "BINARY_OP_WRONG_TYPE"
+        action = "Rewrite SQL Server operators incompatible with Databricks SQL (e.g. '+' string concatenation to '||' or concat(...)), validate locally, then resume."
     elif "DATATYPE_MISMATCH" in upper or "data type mismatch" in low or "cannot cast" in low:
         category = "LOAD" if "LOAD" in stage.upper() else "TARGET_SCHEMA"
         code, deterministic = "DATATYPE_MISMATCH", True

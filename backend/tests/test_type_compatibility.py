@@ -58,6 +58,17 @@ def test_binary_mismatch_error_is_actionable_and_deterministic():
     assert "HEX_STRING_TO_BINARY" in info["recommended_action"]
 
 
+def test_binary_op_wrong_type_classified_as_databricks_syntax():
+    info = classify_execution_error(
+        '[DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve "(first_name +  )" due to data type mismatch: the binary operator requires the input type ("NUMERIC" or "INTERVAL DAY TO SECOND" or "INTERVAL YEAR TO MONTH" or "INTERVAL" or "DECFLOAT"), not "STRING". SQLSTATE: 42K09; line 7 pos 8',
+        "EXECUTE_DDL",
+    )
+    assert info["error_category"] == "DATABRICKS_SYNTAX"
+    assert info["error_code"] == "BINARY_OP_WRONG_TYPE"
+    assert "||" in info["recommended_action"]
+
+
+
 def test_bronze_loader_builds_binary_safe_source_and_target_sql(db, monkeypatch):
     project = ensure_project(db, "Binary transport project")
     source = add_source(db, project.id, "src", "server", "DB1")

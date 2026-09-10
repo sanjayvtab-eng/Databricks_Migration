@@ -57,9 +57,104 @@ def classify_trigger(definition: str) -> tuple[str,str]:
     if any(k in d for k in ["send","mail","notify"]): return "NOTIFICATION","Workflow/notification integration"
     return "OPERATIONAL_SIDE_EFFECT","ARCHITECT_REVIEW"
 
+TOKEN_PATTERN = re.compile(
+    r'(?P<comment>--[^\r\n]*|/\*[\s\S]*?\*/)|'
+    r'(?P<string>(?:N|n)?\'(?:[^\']|\'\')*\')|'
+    r'(?P<plus>\+)|'
+    r'(?P<boundary>[,;])|'
+    r'(?P<paren>[()])|'
+    r'(?P<ws>\s+)|'
+    r'(?P<word>[A-Za-z0-9_#@$]+|\[[^\]]+\]|`[^`]+`)|'
+    r'(?P<symbol>[^\sA-Za-z0-9_#@$\[\]`,\';()+]+)',
+    re.DOTALL,
+)
+
+STRING_FUNC_NAMES = {"CHAR", "CHR", "SPACE", "REPLICATE", "STR", "CONCAT", "CONCAT_WS"}
+
+
+def rewrite_tsql_concat(sql: str) -> str:
+    """Rewrite SQL Server string concatenation operator '+' to Databricks '||'."""
+    if not sql or "+" not in sql:
+        return sql
+
+    tokens = []
+    for m in TOKEN_PATTERN.finditer(sql):
+        tokens.append({"kind": m.lastgroup, "val": m.group(0)})
+
+    def is_ignorable(idx: int) -> bool:
+        if idx < 0 or idx >= len(tokens):
+            return True
+        return tokens[idx]["kind"] in ("comment", "ws")
+
+    def prev_sig(idx: int) -> int | None:
+        p = idx - 1
+        while p >= 0 and is_ignorable(p):
+            p -= 1
+        return p if p >= 0 else None
+
+    def next_sig(idx: int) -> int | None:
+        n = idx + 1
+        while n < len(tokens) and is_ignorable(n):
+            n += 1
+        return n if n < len(tokens) else None
+
+    string_like: set[int] = set()
+    for i, t in enumerate(tokens):
+        if t["kind"] == "string":
+            string_like.add(i)
+
+    matching_open: dict[int, int] = {}
+    matching_close: dict[int, int] = {}
+    paren_stack: list[int] = []
+    for i, t in enumerate(tokens):
+        if t["kind"] == "paren":
+            if t["val"] == "(":
+                paren_stack.append(i)
+            elif t["val"] == ")" and paren_stack:
+                open_i = paren_stack.pop()
+                matching_open[i] = open_i
+                matching_close[open_i] = i
+                p = prev_sig(open_i)
+                if p is not None and tokens[p]["kind"] == "word":
+                    if tokens[p]["val"].upper() in STRING_FUNC_NAMES:
+                        string_like.add(p)
+                        string_like.add(i)
+
+    changed = True
+    while changed:
+        changed = False
+        for i, t in enumerate(tokens):
+            if t["kind"] == "plus":
+                p = prev_sig(i)
+                n = next_sig(i)
+                if p is not None and n is not None:
+                    if tokens[p]["kind"] == "boundary" or tokens[n]["kind"] == "boundary":
+                        continue
+                    if p in string_like or n in string_like:
+                        t["kind"] = "concat"
+                        t["val"] = "||"
+                        string_like.add(p)
+                        string_like.add(n)
+                        if tokens[p]["val"] == ")" and p in matching_open:
+                            open_i = matching_open[p]
+                            string_like.add(open_i)
+                            func_p = prev_sig(open_i)
+                            if func_p is not None:
+                                string_like.add(func_p)
+                        if tokens[n]["kind"] == "word":
+                            next_p = next_sig(n)
+                            if next_p is not None and tokens[next_p]["val"] == "(" and next_p in matching_close:
+                                string_like.add(matching_close[next_p])
+                        changed = True
+
+    return "".join(t["val"] for t in tokens)
+
+
 def rewrite_common_tsql(sql: str) -> str:
-    out = re.sub(r"\bGETDATE\s*\(\s*\)", "current_timestamp()", sql, flags=re.I)
+    out = rewrite_tsql_concat(sql)
+    out = re.sub(r"\bGETDATE\s*\(\s*\)", "current_timestamp()", out, flags=re.I)
     out = re.sub(r"\bISNULL\s*\(", "coalesce(", out, flags=re.I)
     out = re.sub(r"\[([^\]]+)\]", r"`\1`", out)
     out = re.sub(r"\bTOP\s*\(?(\d+)\)?\s+", "", out, flags=re.I)
     return out
+

@@ -1309,6 +1309,10 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
         selected = ",\n  ".join(qident(c.column_name) for c in cols)
         return f"CREATE OR REPLACE VIEW {node.target_fqn} AS\nSELECT\n  {selected}\nFROM {bronze.target_fqn};", True, []
     if node.layer == "SILVER" and obj and obj.object_type == "VIEW":
+        repaired = _approved_repaired_artifact(db, project_id, obj.id, environment)
+        if repaired:
+            content = _retarget_view_header(repaired.content, node.target_fqn)
+            return content, bool(content.strip()), [] if content.strip() else ["View definition empty"]
         content = rewrite_common_tsql(obj.definition or "")
         content = _replace_source_references(db, project_id, environment, content, for_gold=False)
         content = _retarget_view_header(content, node.target_fqn)
