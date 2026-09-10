@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     database_url: str = f"sqlite:///{DEFAULT_DB.as_posix()}"
     jwt_secret: str = "change-me-in-production-minimum-32-characters"
     jwt_algorithm: str = "HS256"
-    access_token_minutes: int = 60
+    access_token_minutes: int = 1440
     allowed_origins: str = "http://localhost:5173,http://localhost:5174"
     bootstrap_admin_username: str | None = None
     bootstrap_admin_password: str | None = None

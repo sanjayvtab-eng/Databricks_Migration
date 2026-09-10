@@ -6,6 +6,10 @@ export async function api<T>(path:string,init:RequestInit={}):Promise<T>{
   if(token())h.set('Authorization',`Bearer ${token()}`);
   const r=await fetch(`${API}${path}`,{...init,headers:h});
   const payload=await r.json().catch(()=>({detail:r.statusText}));
+  if(r.status===401){
+    localStorage.removeItem('mf_token');
+    window.dispatchEvent(new Event('auth_expired'));
+  }
   if(!r.ok)throw new Error(payload.detail||r.statusText);
   return payload as T;
 }

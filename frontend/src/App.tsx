@@ -399,6 +399,13 @@ export default function App() {
     }
   }
   useEffect(() => {
+    function onAuthExpired() {
+      setReady(false);
+    }
+    window.addEventListener("auth_expired", onAuthExpired);
+    return () => window.removeEventListener("auth_expired", onAuthExpired);
+  }, []);
+  useEffect(() => {
     refresh();
   }, [ready, pid, page]);
   async function action(fn: () => Promise<any>) {
@@ -410,6 +417,10 @@ export default function App() {
       await refresh();
       return r;
     } catch (e: any) {
+      if (String(e.message).includes("Invalid or expired token") || String(e.message).includes("Authentication required")) {
+        localStorage.removeItem("mf_token");
+        setReady(false);
+      }
       setMsg(e.message);
       return null;
     } finally {
