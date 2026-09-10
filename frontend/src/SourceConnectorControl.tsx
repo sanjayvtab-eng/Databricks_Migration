@@ -45,10 +45,11 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
       setError(e instanceof Error ? e.message : "Connector update failed");
     } finally { setBusy(false); }
   };
+  const [driver, setDriver] = useState("ODBC Driver 17 for SQL Server");
+  const [trustCert, setTrustCert] = useState(true);
   const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
-  const isSqlExpress = source.server_name.toUpperCase().includes("\\SQLEXPRESS");
-  const certificateOption = isSqlExpress ? " --trust-server-certificate" : "";
-  const command = `python scripts/local_connector.py --url ${quote(window.location.origin)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)} --driver ${quote("ODBC Driver 18 for SQL Server")}${certificateOption}`;
+  const certificateOption = trustCert ? " --trust-server-certificate" : "";
+  const command = `python scripts/local_connector.py --url ${quote(window.location.origin)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)} --driver ${quote(driver)}${certificateOption}`;
 
   return <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
     <span>{status === "DIRECT" ? "Direct connection" : `Connector: ${status.toLowerCase()}`}</span>
@@ -63,9 +64,21 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
         {registration ? <>
           <p>Registration token is shown once. Enter it at the connector's password prompt.</p>
           <textarea aria-label="Registration token" readOnly value={registration.token} rows={3} style={{ width: "100%", boxSizing: "border-box" }} />
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 16, margin: "14px 0 8px 0" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9rem" }}>
+              <span><strong>ODBC Driver:</strong></span>
+              <select value={driver} onChange={(e) => setDriver(e.target.value)} style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #c1c7d0" }}>
+                <option value="ODBC Driver 17 for SQL Server">ODBC Driver 17 for SQL Server (Recommended)</option>
+                <option value="ODBC Driver 18 for SQL Server">ODBC Driver 18 for SQL Server</option>
+              </select>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9rem", cursor: "pointer" }}>
+              <input type="checkbox" checked={trustCert} onChange={(e) => setTrustCert(e.target.checked)} />
+              <span>Trust Server Certificate (<code>--trust-server-certificate</code>)</span>
+            </label>
+          </div>
           <p>From the updated repository folder on the SQL Server machine:</p>
           <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pip install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
-          {isSqlExpress && <p><strong>Certificate setting:</strong> This SQL Express command trusts its local/self-signed certificate while keeping transport encryption enabled.</p>}
           <p>Windows Authentication uses the account running this command. For SQL Authentication add <code>--username 'your-sql-login'</code>; the password is prompted locally.</p>
           <p>Keep the connector running. When its status becomes online, close this panel and select Test. See <code>docs/LOCAL_CONNECTOR.md</code> for certificate setup and recovery.</p>
         </> : <p>Registration switches this source to connector mode. Registering again invalidates the previous token and cancels pending connector tasks.</p>}

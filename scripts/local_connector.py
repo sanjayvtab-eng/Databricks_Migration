@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import threading
@@ -51,9 +52,24 @@ class LocalAgent:
 
     def connect(self):
         import pyodbc
-        conn = pyodbc.connect(self.connection_string, timeout=10, autocommit=True)
-        conn.timeout = 60
-        return conn
+        try:
+            conn = pyodbc.connect(self.connection_string, timeout=10, autocommit=True)
+            conn.timeout = 60
+            return conn
+        except pyodbc.Error as exc:
+            if "IM002" in str(exc):
+                installed = [d for d in pyodbc.drivers() if "SQL Server" in d]
+                for alt in ["ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server", "SQL Server"]:
+                    if alt in installed and alt not in self.connection_string:
+                        alt_cs = re.sub(r"DRIVER=\{[^}]+\}", f"DRIVER={{{alt}}}", self.connection_string)
+                        try:
+                            conn = pyodbc.connect(alt_cs, timeout=10, autocommit=True)
+                            conn.timeout = 60
+                            self.connection_string = alt_cs
+                            return conn
+                        except Exception:
+                            continue
+            raise
 
     def cleanup(self, all_streams=False):
         for key, item in list(self.streams.items()):
@@ -152,7 +168,7 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--server", required=True)
     parser.add_argument("--database", required=True)
-    parser.add_argument("--driver", default="ODBC Driver 18 for SQL Server")
+    parser.add_argument("--driver", default="ODBC Driver 17 for SQL Server")
     parser.add_argument("--username", help="Omit to use the Windows account running this process")
     parser.add_argument("--trust-server-certificate", action="store_true")
     args = parser.parse_args()
