@@ -36,7 +36,7 @@ from .engine import (
     static_validate,
     uid,
 )
-from .rules import map_sqlserver_type, rewrite_common_tsql, rewrite_tsql_concat
+from .rules import map_sqlserver_type, rewrite_common_tsql, rewrite_tsql_concat, rewrite_recursive_cte
 
 
 REMEDIABLE_ISSUE_TYPES = {
@@ -295,7 +295,7 @@ def _issue_route(issue: MigrationIssue | None) -> tuple[str | None, bool, str | 
         return "COMPATIBILITY_ENGINE", True, "LOAD"
     if "ARRAY<VOID>" in technical_text and "BINARY" in technical_text:
         return "COMPATIBILITY_ENGINE", True, "LOAD"
-    if "BINARY_OP_WRONG_TYPE" in technical_text or "STRING_CONCATENATION" in technical_text:
+    if "BINARY_OP_WRONG_TYPE" in technical_text or "STRING_CONCATENATION" in technical_text or "RECURSIVE" in technical_text or "ORGCHART" in technical_text:
         return "DETERMINISTIC_THEN_AI", True, "DATABRICKS_SYNTAX"
     if deterministic and category in RUNTIME_DETERMINISTIC_CATEGORIES:
         return "COMPATIBILITY_ENGINE", True, category
@@ -392,6 +392,7 @@ def validate_candidate_content(o: MigrationObject, m: MigrationMapping, candidat
     candidate = _strip_markdown_fence(candidate)
     candidate = normalize_databricks_routine_contract(candidate, o.object_type)
     candidate = rewrite_tsql_concat(candidate)
+    candidate = rewrite_recursive_cte(candidate)
     errors: list[str] = []
     warnings: list[str] = []
     upper = candidate.upper()
@@ -593,6 +594,7 @@ Non-negotiable controls:
 - Replace source references only with a supplied project/environment mapping.
 - Generate an executable DEV candidate, not commentary, Markdown or deployment claims.
 - For Databricks SQL views, queries, and routines: never use '+' for string concatenation. Use the Databricks '||' operator or concat(...) for string concatenation (e.g. `first_name || ' ' || last_name`).
+- For Databricks SQL CTEs: self-referencing (recursive) common table expressions must use WITH RECURSIVE (e.g. `WITH RECURSIVE OrgChart AS ...`).
 - For Databricks SQL functions: use CREATE OR REPLACE FUNCTION and LANGUAGE SQL. If the function queries tables or views (via FROM or JOIN), specify READS SQL DATA after LANGUAGE SQL; never use CONTAINS SQL when querying tables or views.
 - For Databricks procedures: use CREATE OR REPLACE PROCEDURE, LANGUAGE SQL, and SQL SECURITY INVOKER.
 - Never emit DROP, TRUNCATE, DELETE, catalog/schema changes, secrets, approval, or production actions.

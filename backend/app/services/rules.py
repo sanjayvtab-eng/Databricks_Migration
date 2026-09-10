@@ -150,11 +150,90 @@ def rewrite_tsql_concat(sql: str) -> str:
     return "".join(t["val"] for t in tokens)
 
 
+def rewrite_recursive_cte(sql: str) -> str:
+    """Rewrite self-referencing SQL Server CTEs to standard Databricks 'WITH RECURSIVE'."""
+    if not sql or "WITH" not in sql.upper():
+        return sql
+
+    pattern = re.compile(r"\bWITH\s+(?!RECURSIVE\b)", re.I)
+
+    for match in list(pattern.finditer(sql))[::-1]:
+        with_start = match.start()
+        with_end = match.end()
+        remainder = sql[with_end:]
+
+        cte_def_pattern = re.compile(
+            r"([`\[\w]+)\s*(?:\([^)]*\))?\s*AS\s*\(",
+            re.I,
+        )
+
+        is_recursive = False
+        pos = 0
+        while pos < len(remainder):
+            cte_m = cte_def_pattern.search(remainder, pos)
+            if not cte_m:
+                break
+            cte_name = cte_m.group(1).strip("`[]")
+            body_start = cte_m.end()
+
+            depth = 1
+            i = body_start
+            in_single_line_comment = False
+            in_multi_line_comment = False
+            in_string = False
+
+            while depth > 0 and i < len(remainder):
+                ch = remainder[i]
+                next_ch = remainder[i + 1] if i + 1 < len(remainder) else ""
+
+                if in_single_line_comment:
+                    if ch == "\n":
+                        in_single_line_comment = False
+                elif in_multi_line_comment:
+                    if ch == "*" and next_ch == "/":
+                        in_multi_line_comment = False
+                        i += 1
+                elif in_string:
+                    if ch == "'":
+                        if next_ch == "'":
+                            i += 1
+                        else:
+                            in_string = False
+                else:
+                    if ch == "-" and next_ch == "-":
+                        in_single_line_comment = True
+                        i += 1
+                    elif ch == "/" and next_ch == "*":
+                        in_multi_line_comment = True
+                        i += 1
+                    elif ch == "'":
+                        in_string = True
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+
+                i += 1
+
+            cte_body = remainder[body_start : i - 1]
+            if re.search(rf"\b{re.escape(cte_name)}\b", cte_body, re.I):
+                is_recursive = True
+                break
+            pos = i
+
+        if is_recursive:
+            sql = sql[:with_start] + "WITH RECURSIVE " + sql[with_end:]
+
+    return sql
+
+
 def rewrite_common_tsql(sql: str) -> str:
     out = rewrite_tsql_concat(sql)
+    out = rewrite_recursive_cte(out)
     out = re.sub(r"\bGETDATE\s*\(\s*\)", "current_timestamp()", out, flags=re.I)
     out = re.sub(r"\bISNULL\s*\(", "coalesce(", out, flags=re.I)
     out = re.sub(r"\[([^\]]+)\]", r"`\1`", out)
     out = re.sub(r"\bTOP\s*\(?(\d+)\)?\s+", "", out, flags=re.I)
     return out
+
 

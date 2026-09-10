@@ -571,8 +571,12 @@ def classify_execution_error(exc: Exception | str, stage: str = "UNKNOWN") -> di
         "table_or_view_not_found" in low or "table or view not found" in low or "relation does not exist" in low
         or re.search(r"\b(?:table|view|relation)\b.*\bdoes not exist\b", low)
     ):
-        category, code = "DEPENDENCY", "TARGET_DEPENDENCY_NOT_FOUND"
-        action = "Verify project/environment mappings and dependency order, deploy prerequisites, then resume."
+        if any(w in upper for w in ("ORGCHART", "CTE", "RECURSIVE")):
+            category, code = "DATABRICKS_SYNTAX", "RECURSIVE_CTE_SYNTAX"
+            action = "Add RECURSIVE to the WITH clause (e.g. WITH RECURSIVE cte_name AS ...) for self-referencing CTEs, then resume."
+        else:
+            category, code = "DEPENDENCY", "TARGET_DEPENDENCY_NOT_FOUND"
+            action = "Verify project/environment mappings and dependency order, deploy prerequisites, then resume."
     elif "schema drift" in low or "target schema" in low:
         category, code = "TARGET_SCHEMA", "TARGET_SCHEMA_DRIFT"
         action = "Run schema comparison and apply the configured safe ALTER/DEV replacement policy with approval where required."

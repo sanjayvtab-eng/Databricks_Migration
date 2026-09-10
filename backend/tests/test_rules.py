@@ -36,3 +36,17 @@ def test_rewrite_tsql_concat_edge_cases():
     assert rewrite_tsql_concat("'A + B'") == "'A + B'"
     assert rewrite_tsql_concat("-- comment with +\nSELECT 1") == "-- comment with +\nSELECT 1"
 
+def test_rewrite_recursive_cte():
+    sql = """
+    CREATE VIEW [dbo].[employee_org_chart] AS
+    WITH OrgChart (emp_id, mgr_id, lvl) AS (
+        SELECT employee_id, manager_id, 0 FROM [employees] WHERE manager_id IS NULL
+        UNION ALL
+        SELECT e.employee_id, e.manager_id, o.lvl + 1 FROM [employees] e INNER JOIN OrgChart o ON e.manager_id = o.emp_id
+    )
+    SELECT * FROM OrgChart
+    """
+    rewritten = rewrite_common_tsql(sql)
+    assert "WITH RECURSIVE `OrgChart`" in rewritten or "WITH RECURSIVE OrgChart" in rewritten
+
+

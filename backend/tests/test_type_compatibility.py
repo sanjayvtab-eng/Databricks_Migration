@@ -68,6 +68,17 @@ def test_binary_op_wrong_type_classified_as_databricks_syntax():
     assert "||" in info["recommended_action"]
 
 
+def test_recursive_cte_error_classified_as_databricks_syntax():
+    info = classify_execution_error(
+        '[TABLE_OR_VIEW_NOT_FOUND] The table or view `OrgChart` cannot be found. Verify the spelling and correctness of the schema and catalog.\nSQLSTATE: 42P01; line 18 pos 15',
+        "EXECUTE_DDL",
+    )
+    assert info["error_category"] == "DATABRICKS_SYNTAX"
+    assert info["error_code"] == "RECURSIVE_CTE_SYNTAX"
+    assert "WITH RECURSIVE" in info["recommended_action"]
+
+
+
 
 def test_bronze_loader_builds_binary_safe_source_and_target_sql(db, monkeypatch):
     project = ensure_project(db, "Binary transport project")
