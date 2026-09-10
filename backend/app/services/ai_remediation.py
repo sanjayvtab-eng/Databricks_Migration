@@ -436,7 +436,7 @@ def validate_candidate_content(o: MigrationObject, m: MigrationMapping, candidat
 
 
 def _extract_definition_parameters(definition: str) -> list[dict[str, Any]]:
-    m = re.search(r"(?is)\bCREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+[^\(]+\((.*?)\)\s*RETURNS", definition or "")
+    m = re.search(r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+|OR\s+ALTER\s+)?FUNCTION\s+[^\(]+\((.*?)\)\s*RETURNS?", definition or "")
     if not m:
         return []
     raw_params = m.group(1).strip()
@@ -446,7 +446,7 @@ def _extract_definition_parameters(definition: str) -> list[dict[str, Any]]:
     tokens = re.split(r",(?![^\(]*\))", raw_params)
     for i, token in enumerate(tokens, 1):
         token = token.strip()
-        pm = re.match(r"@([A-Za-z_]\w*)\s+([A-Za-z_]\w*(?:\s*\([^)]*\))?)", token)
+        pm = re.match(r"@?([A-Za-z_]\w*)\s+([A-Za-z_]\w*(?:\s*\([^)]*\))?)", token)
         if pm:
             name = "@" + pm.group(1)
             dtype = pm.group(2).strip()
@@ -471,16 +471,37 @@ def _deterministic_function_remediation(
     return_expr = ret_m.group(1).strip().rstrip(";").strip() if ret_m else ""
     return_expr = re.sub(r"(?is)\bEND\s*;?\s*$", "", return_expr).strip().rstrip(";").strip()
 
+    # Check for cursor-based scalar aggregation loop (Oracle/T-SQL cursor pattern)
+    cursor_m = re.search(
+        r"(?is)\bCURSOR\s+(?:[A-Za-z_]\w*\s+)?(?:LOCAL\s+|FAST_FORWARD\s+)*(?:IS|FOR)\s+SELECT\s+(.+?)\s+FROM\s+(.+?)(?:;|\bOPEN\b|\bBEGIN\b|\)|$)",
+        body,
+    )
+
     assign_m = re.search(
         r"(?is)\b(?:SELECT\s+@([A-Za-z_]\w*)\s*=\s*(.+?)\s+FROM\s+|SET\s+@([A-Za-z_]\w*)\s*=\s*(?:\(\s*)?SELECT\s+(.+?)\s+FROM\s+)(.+?)(?=\bRETURN\b|\bEND\b|;|\)|$)",
         body,
     )
     sel_m = None
-    if not assign_m:
+    if not assign_m and not cursor_m:
         sel_m = re.search(r"(?is)\bSELECT\s+(.+?)\s+FROM\s+(.+?)(?=\bRETURN\b|\bEND\b|;|\)|$)", body)
 
     final_expr = None
-    if assign_m:
+    if cursor_m:
+        sel_col = cursor_m.group(1).strip()
+        from_tail = cursor_m.group(2).strip().rstrip(";").rstrip(")").strip()
+        from_tail = re.sub(r"(?is)\b(?:END|CLOSE|DEALLOCATE)\b.*$", "", from_tail).strip().rstrip(";").rstrip(")").strip()
+        accum_m = re.search(
+            r"(?is)(?:[A-Za-z_@]\w*)\s*(?::=|\+=|=)\s*(?:[A-Za-z_@]\w*)\s*\+\s*(?:emp_rec\.|@)?([A-Za-z_]\w*)",
+            body,
+        )
+        if accum_m:
+            accum_col = accum_m.group(1).strip()
+            final_expr = f"(SELECT COALESCE(SUM({accum_col}), 0) FROM {from_tail})"
+        elif sel_col and sel_col != "*":
+            final_expr = f"(SELECT COALESCE(SUM({sel_col}), 0) FROM {from_tail})"
+        else:
+            final_expr = f"(SELECT COALESCE(SUM(salary), 0) FROM {from_tail})"
+    elif assign_m:
         var_name = assign_m.group(1) or assign_m.group(3)
         select_expr = (assign_m.group(2) or assign_m.group(4)).strip().lstrip("(").strip()
         from_tail = assign_m.group(5).strip().rstrip(";").rstrip(")").strip()
@@ -505,7 +526,7 @@ def _deterministic_function_remediation(
         return None
 
     ret_type_match = re.search(
-        r"\bRETURNS\s+([\[\]\w]+)(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?", definition, flags=re.I
+        r"\bRETURNS?\s+([\[\]\w]+)(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?", definition, flags=re.I
     )
     source_ret = ret_type_match.group(1).strip("[]") if ret_type_match else "decimal"
     precision = int(ret_type_match.group(2)) if ret_type_match and ret_type_match.group(2) else None

@@ -285,3 +285,53 @@ def test_function_remediation_parses_definition_parameters_when_metadata_missing
     assert rem['deterministic_validation']['valid'] is True
 
 
+def test_oracle_cursor_function_remediation_collapses_to_sum_aggregate(db):
+    p = ensure_project(db, 'Oracle cursor project')
+    s = add_source(db, p.id, 'src', 'server', 'DB1')
+    snapshot = {'database': 'DB1', 'objects': [
+        {'schema': 'dbo', 'name': 'employees', 'type': 'TABLE', 'columns': [
+            {'name': 'department_id', 'type': 'int'}, {'name': 'salary', 'type': 'decimal', 'precision': 10, 'scale': 2}
+        ]},
+        {'schema': 'dbo', 'name': 'total_department_payroll', 'type': 'FUNCTION', 'definition': '''
+            CREATE OR REPLACE FUNCTION total_department_payroll(p_department_id NUMBER)
+            RETURN NUMBER IS
+                v_total NUMBER(12,2) := 0;
+                CURSOR emp_cursor IS
+                    SELECT * FROM employees WHERE department_id = p_department_id;
+                emp_rec employees%ROWTYPE;
+            BEGIN
+                OPEN emp_cursor;
+                LOOP
+                    FETCH emp_cursor INTO emp_rec;
+                    EXIT WHEN emp_cursor%NOTFOUND;
+
+                    v_total := v_total + emp_rec.salary;
+                END LOOP;
+                CLOSE emp_cursor;
+
+                RETURN v_total;
+            END total_department_payroll;
+        '''}
+    ]}
+    ingest_snapshot(db, p.id, s.id, snapshot)
+    classify_project(db, p.id)
+    create_mappings(db, p.id, 'DEV', 'migration_dev')
+
+    from app.services.ai_remediation import analyze_remediation, remediate_one_artifact
+    obj = db.scalar(select(MigrationObject).where(
+        MigrationObject.project_id == p.id,
+        MigrationObject.object_name == 'total_department_payroll',
+    ))
+    generate_artifact(db, p.id, obj.id)
+    rem = analyze_remediation(db, p.id, obj.id, 'DEV', use_ai=False)
+    assert 'CREATE OR REPLACE FUNCTION' in rem['generated_candidate']
+    assert '`p_department_id`' in rem['generated_candidate']
+    assert 'READS SQL DATA' in rem['generated_candidate']
+    assert 'COALESCE(SUM(salary), 0)' in rem['generated_candidate']
+    assert rem['deterministic_validation']['valid'] is True
+
+    repaired = remediate_one_artifact(db, p.id, obj.id, environment='DEV', use_ai=False)
+    assert repaired['status'] == 'READY_FOR_REVIEW'
+    assert repaired['static_validation']['valid'] is True
+
+

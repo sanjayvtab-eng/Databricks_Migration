@@ -4,6 +4,7 @@ import re
 TYPE_MAP = {
     "bigint":"BIGINT", "int":"INT", "smallint":"SMALLINT", "tinyint":"SMALLINT",
     "bit":"BOOLEAN", "float":"DOUBLE", "real":"FLOAT", "char":"STRING", "varchar":"STRING",
+    "varchar2":"STRING", "nvarchar2":"STRING", "clob":"STRING", "nclob":"STRING", "blob":"BINARY",
     "text":"STRING", "nchar":"STRING", "nvarchar":"STRING", "ntext":"STRING", "date":"DATE",
     "datetime":"TIMESTAMP", "datetime2":"TIMESTAMP", "smalldatetime":"TIMESTAMP",
     "uniqueidentifier":"STRING", "binary":"BINARY", "varbinary":"BINARY", "image":"BINARY",
@@ -15,7 +16,7 @@ def map_sqlserver_type(name: str, precision: int|None=None, scale: int|None=None
     raw = name.lower().strip().replace("[", "").replace("]", "")
     declared = re.fullmatch(r"([a-z0-9_]+)\s*\(\s*(max|\d+)\s*(?:,\s*(\d+)\s*)?\)", raw)
     n = declared.group(1) if declared else raw
-    if n in {"decimal","numeric"}:
+    if n in {"decimal","numeric","number"}:
         declared_precision = int(declared.group(2)) if declared and declared.group(2).isdigit() else None
         declared_scale = int(declared.group(3)) if declared and declared.group(3) else None
         return f"DECIMAL({precision or declared_precision or 38},{scale if scale is not None else (declared_scale or 0)})"
@@ -230,8 +231,8 @@ def rewrite_recursive_cte(sql: str) -> str:
 def rewrite_common_tsql(sql: str) -> str:
     out = rewrite_tsql_concat(sql)
     out = rewrite_recursive_cte(out)
-    out = re.sub(r"\bGETDATE\s*\(\s*\)", "current_timestamp()", out, flags=re.I)
-    out = re.sub(r"\bISNULL\s*\(", "coalesce(", out, flags=re.I)
+    out = re.sub(r"\b(?:GETDATE|SYSDATE|SYSTIMESTAMP)\s*(?:\(\s*\))?", "current_timestamp()", out, flags=re.I)
+    out = re.sub(r"\b(?:ISNULL|NVL)\s*\(", "coalesce(", out, flags=re.I)
     out = re.sub(r"\[([^\]]+)\]", r"`\1`", out)
     out = re.sub(r"\bTOP\s*\(?(\d+)\)?\s+", "", out, flags=re.I)
     return out

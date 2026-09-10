@@ -246,12 +246,12 @@ def _replace_known_references(db: Session, project_id: str, environment: str, co
 
 
 def _clean_routine_body(definition: str) -> str:
-    # Strip routine header and common T-SQL session noise without inventing logic.
-    m=re.search(r"\bAS\b(.*)$",definition or "",flags=re.I|re.S)
+    # Strip routine header and common T-SQL / PL/SQL session noise without inventing logic.
+    m=re.search(r"\b(?:AS|IS)\b(.*)$",definition or "",flags=re.I|re.S)
     body=(m.group(1) if m else definition or "").strip()
     body=re.sub(r"^\s*BEGIN\b","",body,flags=re.I).strip()
     body=re.sub(r"(?is)\bGO\s*;?\s*$", "", body).strip()
-    body=re.sub(r"(?is)\bEND\s*;?\s*$", "", body).strip()
+    body=re.sub(r"(?is)\bEND\s*(?:[A-Za-z_]\w*)?\s*;?\s*$", "", body).strip()
     body=re.sub(r"\bSET\s+NOCOUNT\s+ON\s*;?","",body,flags=re.I)
     body=re.sub(r"\bSET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
     body=re.sub(r"\bSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
