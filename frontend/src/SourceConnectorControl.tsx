@@ -64,7 +64,7 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
           <p>Registration token is shown once. Enter it at the connector's password prompt.</p>
           <textarea aria-label="Registration token" readOnly value={registration.token} rows={3} style={{ width: "100%", boxSizing: "border-box" }} />
           <p>From the updated repository folder on the SQL Server machine:</p>
-          <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pi install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
+          <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pip install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
           {isSqlExpress && <p><strong>Certificate setting:</strong> This SQL Express command trusts its local/self-signed certificate while keeping transport encryption enabled.</p>}
           <p>Windows Authentication uses the account running this command. For SQL Authentication add <code>--username 'your-sql-login'</code>; the password is prompted locally.</p>
           <p>Keep the connector running. When its status becomes online, close this panel and select Test. See <code>docs/LOCAL_CONNECTOR.md</code> for certificate setup and recovery.</p>
